@@ -71,6 +71,11 @@ class BalterCloudClient:
         self._client_id = client_id or f"003-{APP_ID}-{secrets.token_hex(8)}"
         self._jsessionid: str | None = None
         self._server_session: str = ""
+        # qvcloud.net serves a private QUALVISION CA whose 2017-era certs lack an
+        # Authority Key Identifier, so OpenSSL 3 (Home Assistant) refuses to verify them
+        # even when the CA is trusted. The app's Android BoringSSL is lenient here; we
+        # skip verification for these calls to match it.
+        self._ssl = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -118,6 +123,7 @@ class BalterCloudClient:
         async with self._session.get(
             self._base,
             headers=self._headers(),
+            ssl=self._ssl,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -151,6 +157,7 @@ class BalterCloudClient:
             self._base,
             data=body.encode("utf-8"),
             headers=self._headers("application/xml"),
+            ssl=self._ssl,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -188,6 +195,7 @@ class BalterCloudClient:
             self._base,
             data=body.encode("utf-8"),
             headers=self._headers("application/xml"),
+            ssl=self._ssl,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -232,6 +240,7 @@ class BalterCloudClient:
             self._base,
             data=json.dumps(body).encode("utf-8"),
             headers=self._headers("application/json;charset=utf-8"),
+            ssl=self._ssl,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -298,6 +307,7 @@ class BalterCloudClient:
             url,
             data=body.encode("utf-8"),
             headers=self._headers("application/xml; charset=UTF-8"),
+            ssl=self._ssl,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
