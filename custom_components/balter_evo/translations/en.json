@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balter EVO / Quvii Cloud",
+        "description": "Sign in with your cloud account (not the local device password) and the door PIN you use in the Balter app to unlock.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "door_pin": "Door PIN (for unlocking)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Could not connect to the Quvii cloud server"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  }
+}

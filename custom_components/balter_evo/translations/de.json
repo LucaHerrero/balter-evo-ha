@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balter EVO / Quvii Cloud",
+        "description": "Login mit deinem Cloud-Account (nicht das lokale Geräte-Passwort) und der Tür-PIN, die du in der Balter-App zum Entriegeln nutzt.",
+        "data": {
+          "email": "E-Mail",
+          "password": "Passwort",
+          "door_pin": "Tür-PIN (zum Entriegeln)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "E-Mail oder Passwort falsch",
+      "cannot_connect": "Verbindung zum Quvii-Cloud-Server fehlgeschlagen"
+    },
+    "abort": {
+      "already_configured": "Dieser Account ist bereits eingerichtet"
+    }
+  }
+}

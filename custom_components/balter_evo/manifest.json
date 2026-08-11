@@ -1,0 +1,12 @@
+{
+  "domain": "balter_evo",
+  "name": "Balter EVO (Quvii Cloud)",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://www.balter.de",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "",
+  "requirements": [],
+  "version": "0.1.0"
+}
