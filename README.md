@@ -10,8 +10,9 @@ Per Reverse Engineering (dynamische Traffic-Analyse der Android-App) nachgebaut 
 
 ## Funktionsumfang
 
-- ✅ **Tür entriegeln** – als `lock`-Entität pro erkanntem Schlosskanal (verifiziert funktionierend gegen die echte Cloud-API). Der Türöffner ist momentan: Entriegeln löst den Relais-Impuls aus, danach fällt die Entität nach kurzer Zeit automatisch wieder auf „verriegelt" zurück (optimistischer Zustand, das Gerät verriegelt selbsttätig).
-- ❌ **Live-Video** – (noch) keine Entität. Das Protokoll ist inzwischen aufgeklärt: der Videostrom ist **unverschlüsseltes H.264 (Annex-B)**, das über ein separates, proprietäres P2P-UDP-Protokoll (`C1EFABFF`) läuft; nur der Steuerkanal ist AES-256-CBC-verschlüsselt. Für ein reines Standalone-Video müsste noch der P2P-Transport nachgebaut werden – Details in [`PROTOCOL.md`](PROTOCOL.md).
+- ✅ **Login / Geräteliste / Schlösser** – über die Cloud-API (verifiziert). Die `lock`-Entitäten werden korrekt angelegt.
+- ⚠️ **Tür entriegeln** – **funktioniert (noch) nicht rein über die Cloud.** Der Öffnen-Befehl der App geht nicht an die Cloud, sondern durch den lokalen P2P-Tunnel direkt zum Gerät (`POST /tdkcgi` an `127.0.0.1`). Der Cloud-IoT-Pfad (`openapi-tdk/.../singledev`) wurde getestet und meldet für dieses Gerät „设备未注册" (nicht registriert). Standalone-Unlock erfordert daher den P2P-Transport oder eine Android-Brücke – Details in [`PROTOCOL.md`](PROTOCOL.md).
+- ❌ **Live-Video** – (noch) keine Entität. Das Protokoll ist aufgeklärt: der Videostrom ist **unverschlüsseltes H.264 (Annex-B)** über dasselbe proprietäre P2P-UDP-Protokoll (`C1EFABFF`); nur der Steuerkanal ist AES-256-CBC-verschlüsselt. Für Standalone-Video müsste der P2P-Transport nachgebaut werden.
 
 ## Status
 

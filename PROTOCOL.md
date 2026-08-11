@@ -63,30 +63,41 @@ POST /auth/user  (Content-Type: application/json)
 
 Liefert `chn`-Einträge (`CAM1..4` = Türstationen, `CCTV1..8` = Kameras, je mit `enable`) und `lock`-Einträge. Pro Kanal zwei Schlösser (`lock_chn{N} 1`, `lock_chn{N} 2` → `door={N}`, `locknumber=1|2`), insgesamt 16. Nur Schlösser unter einem `enable:1`-Kanal entsprechen einer real verdrahteten Tür (hier nur `CAM1`/`door=1`).
 
-## Tür öffnen (verifiziert funktionierend)
+## Tür öffnen — NICHT über die Cloud möglich (korrigiert 2026-08-11)
 
-Auf demselben Host/derselben Session wie der Login (`jsessionid`-Cookie):
+**Wichtige Korrektur:** Frühere Notizen behaupteten, Türöffnen liefe über Cloud-HTTPS. Das ist **falsch**. Ein Frida-`SSL_write`-Mitschnitt eines echten Öffnen-Vorgangs zeigt:
 
 ```
-POST /tdkcgi HTTP/1.1
-Content-Type: application/xml; charset=UTF-8
-Cookie: jsessionid=...
+POST /tdkcgi   Host: 127.0.0.1:41163
+```
 
+Der Befehl geht an einen **lokalen Loopback-Proxy** der nativen Bibliothek und wird durch den **P2P-Tunnel direkt zum Gerät** getunnelt – es gibt **keinen Cloud-`/tdkcgi`-Endpunkt** (jeder `r1-*`-Knoten antwortet mit nginx-404). Der CGI-Envelope (unten) ist korrekt, wird aber **im Tunnel** übertragen, nicht per Internet-HTTPS:
+
+```xml
 <envelope>
    <content class="com.quvii.qvweb.device.bean.requset.DeviceUnlockContent">
-      <door>{channel}</door>
-      <locknumber>{1|2}</locknumber>
+      <door>{channel}</door><locknumber>{1|2}</locknumber>
       <password>{sha256(pin)}</password>
    </content>
-   <header>
-      <password>{dynamic_password aus Geräteliste}</password>
-      <security>username</security>
-   </header>
+   <header><password>{dynamic_password}</password><security>username</security></header>
    <command>set.device.opendoor</command>
 </envelope>
 ```
 
-Erfolgsantwort: `<envelope><body><error>0</error><content></content></body></envelope>`
+**Cloud-IoT/MQTT-Alternative getestet – funktioniert für dieses Gerät NICHT.** Die App nutzt eine IoT-Ebene auf `tdkopenapir1.qvcloud.net` (Auth per JWT im `token:`-Header, aus `/qvoauthv2/token`). Der dokumentierte Steuer-Endpunkt
+
+```
+POST https://tdkopenapir1.qvcloud.net/openapi-tdk/devctr/synccontrol/singledev
+token: <JWT>
+{"deviceId":"{duid}","password":"{dynamic_password}","command":"set.device.opendoor",
+ "content":{"password":"{sha256(pin)}","door":1,"locknumber":2}}
+```
+
+liefert `HTTP 200 {"result":3,"message":"...iotserver...设备未注册"}` = **„Gerät nicht registriert"**. Der Endpunkt akzeptiert Auth+Format, aber dieses Gerät (`IDS9459AW`) ist auf der IoT-/MQTT-Steuerebene nicht registriert – es läuft ausschließlich über die P2P/NetSDK-Schiene.
+
+**Fazit:** Türöffnen erfordert – wie das Video – den **P2P-Tunnel** (`libqv-p2p-v2.so`). Ohne dessen Reimplementierung ist Standalone-Unlock nicht möglich; als Brücke bleibt ein eingeloggtes Android-Gerät (ADB-Tap auf den Entriegeln-Button der App).
+
+Nebenbefund: `/openapi-tdk/client/push/token` registriert einen **FCM-Push-Token** – Klingel-/Ruf-Events kommen also per FCM-Push (potenziell als HA-Event nutzbar).
 
 ## Video
 
