@@ -10,12 +10,12 @@ Per Reverse Engineering (dynamische Traffic-Analyse der Android-App) nachgebaut 
 
 ## Funktionsumfang
 
-- ✅ **Tür/Schloss öffnen** – als `button`-Entität pro erkanntem Schlosskanal (verifiziert funktionierend gegen die echte Cloud-API)
-- ❌ **Live-Video** – noch nicht unterstützt (läuft über ein separates, proprietäres P2P-Binärprotokoll, siehe `PROTOCOL.md`)
+- ✅ **Tür entriegeln** – als `lock`-Entität pro erkanntem Schlosskanal (verifiziert funktionierend gegen die echte Cloud-API). Der Türöffner ist momentan: Entriegeln löst den Relais-Impuls aus, danach fällt die Entität nach kurzer Zeit automatisch wieder auf „verriegelt" zurück (optimistischer Zustand, das Gerät verriegelt selbsttätig).
+- ❌ **Live-Video** – (noch) keine Entität. Das Protokoll ist inzwischen aufgeklärt: der Videostrom ist **unverschlüsseltes H.264 (Annex-B)**, das über ein separates, proprietäres P2P-UDP-Protokoll (`C1EFABFF`) läuft; nur der Steuerkanal ist AES-256-CBC-verschlüsselt. Für ein reines Standalone-Video müsste noch der P2P-Transport nachgebaut werden – Details in [`PROTOCOL.md`](PROTOCOL.md).
 
-## Bekannte Einschränkung
+## Status
 
-Der Cloud-Login funktioniert nachweislich aus der echten App heraus, aber die Nachimplementierung mit Standard-HTTP-Clients bekommt aktuell einen `404` vom Server (vermutlich TLS-Fingerprinting oder eine Verbindungsreihenfolge-Abhängigkeit). **Diese Integration ist aktuell experimentell / work in progress** – Beiträge zur Lösung sind willkommen.
+Der Cloud-Login/-Steuerpfad ist vollständig nachgebaut und **end-to-end verifiziert** (Login → Geräteliste → Schlösser → Entriegeln), ohne App, Client-Zertifikat oder TLS-Fingerprint-Tricks: ein einleitender `GET /auth/user` etabliert die Servlet-Session, danach läuft alles über den schlichten `/auth/user`-Pfad. Siehe `PROTOCOL.md`.
 
 ## Installation über HACS
 

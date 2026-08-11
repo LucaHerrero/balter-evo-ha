@@ -12,7 +12,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
 
 from .api import BalterApiError, BalterAuthError, BalterCloudClient
-from .const import APP_ID, CONF_DOOR_PIN, DOMAIN
+from .const import APP_ID, CONF_CLIENT_ID, CONF_DOOR_PIN, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class BalterEvoConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=user_input[CONF_EMAIL],
-                    data={**user_input, "client_id": client_id},
+                    data={**user_input, CONF_CLIENT_ID: client_id},
                 )
 
         return self.async_show_form(

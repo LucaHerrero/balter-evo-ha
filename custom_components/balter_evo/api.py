@@ -2,6 +2,14 @@
 
 Reverse-engineered by capturing real app traffic (see REVERSE_ENGINEERING_NOTES.md).
 Every request/response shape here was observed directly from the live app, not guessed.
+
+Key insight (solves the former "404" blocker): the login POST only works inside an
+already-established servlet session. The client must first do a plain ``GET /auth/user``
+to receive an anonymous ``jsessionid`` cookie, and must POST to the plain ``/auth/user``
+path (NOT the ``;jus_duplex=up`` matrix-parameter variant, which routes into a duplex
+long-poll tunnel that answers with empty ACKs). With those two fixes the whole flow —
+login, device list, sub-device list, unlock — works synchronously from a plain HTTP
+client, no client certificate or TLS fingerprinting workaround required.
 """
 from __future__ import annotations
 
@@ -14,14 +22,14 @@ import xml.etree.ElementTree as ET
 import aiohttp
 
 from .const import (
-    API_HOST,
     APP_ID,
     CLIENT_TYPE,
     CLIENT_VERSION,
+    HOST,
     IP_REGION_ID,
-    LOGIN_HOST,
     OEM_ID,
     REQUEST_TIMEOUT,
+    USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,9 +70,13 @@ class BalterCloudClient:
         self._password = password
         self._client_id = client_id or f"003-{APP_ID}-{secrets.token_hex(8)}"
         self._jsessionid: str | None = None
-        self._duplex_session: str = ""
+        self._server_session: str = ""
 
     # ------------------------------------------------------------------ helpers
+
+    @property
+    def _base(self) -> str:
+        return f"https://{HOST}/auth/user"
 
     def _client_block(self) -> str:
         return (
@@ -74,10 +86,13 @@ class BalterCloudClient:
             "</client>"
         )
 
-    def _cookie_header(self) -> dict[str, str]:
+    def _headers(self, content_type: str | None = None) -> dict[str, str]:
+        headers = {"User-Agent": USER_AGENT}
+        if content_type:
+            headers["Content-Type"] = content_type
         if self._jsessionid:
-            return {"Cookie": f"jsessionid={self._jsessionid}"}
-        return {}
+            headers["Cookie"] = f"jsessionid={self._jsessionid}"
+        return headers
 
     def _remember_cookie(self, response: aiohttp.ClientResponse) -> None:
         set_cookie = response.headers.get("Set-Cookie")
@@ -92,10 +107,29 @@ class BalterCloudClient:
             return default
         return el.text
 
+    # --------------------------------------------------------------- bootstrap
+
+    async def _bootstrap_session(self) -> None:
+        """Obtain an anonymous jsessionid.
+
+        The login POST returns HTTP 404 unless a servlet session already exists, so we
+        must first do a plain GET that makes the server issue a ``Set-Cookie: jsessionid``.
+        """
+        async with self._session.get(
+            self._base,
+            headers=self._headers(),
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as resp:
+            self._remember_cookie(resp)
+            await resp.read()
+        if not self._jsessionid:
+            raise BalterApiError("Could not obtain an anonymous session cookie")
+
     # ------------------------------------------------------------------ login
 
     async def login(self) -> None:
         """Authenticate and establish a jsessionid session. Raises BalterAuthError on failure."""
+        await self._bootstrap_session()
         body = (
             '<?xml version="1.0" encoding="UTF-8"?><envelope>'
             '<content class="com.quvii.qvweb.userauth.bean.request.LoginReqContent">'
@@ -113,11 +147,10 @@ class BalterCloudClient:
             "</header>"
             "</envelope>"
         )
-        url = f"https://{LOGIN_HOST}/auth/user;jus_duplex=up"
         async with self._session.post(
-            url,
+            self._base,
             data=body.encode("utf-8"),
-            headers={"Content-Type": "application/xml", **self._cookie_header()},
+            headers=self._headers("application/xml"),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -129,7 +162,7 @@ class BalterCloudClient:
         result = self._xml_text(root, "./header/result", "-1")
         if result != "0":
             raise BalterAuthError(f"Login rejected by server (result={result})")
-        self._duplex_session = self._xml_text(root, "./header/session/id", "")
+        self._server_session = self._xml_text(root, "./header/session/id", "")
         if not self._jsessionid:
             raise BalterApiError("Login succeeded but no session cookie was returned")
 
@@ -147,15 +180,14 @@ class BalterCloudClient:
             "<header>"
             f"{self._client_block()}"
             "<command>get-device-list</command><flag>tdkcloud</flag><seq>4</seq>"
-            f"<session>{_xml_escape(self._duplex_session)}</session>"
+            f"<session>{_xml_escape(self._server_session)}</session>"
             "</header>"
             "</envelope>"
         )
-        url = f"https://{API_HOST}/auth/user;jus_duplex=up"
         async with self._session.post(
-            url,
+            self._base,
             data=body.encode("utf-8"),
-            headers={"Content-Type": "application/xml", **self._cookie_header()},
+            headers=self._headers("application/xml"),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -172,6 +204,10 @@ class BalterCloudClient:
                     "name": self._xml_text(dev, "name"),
                     "model": self._xml_text(dev, "model"),
                     "dynamic_password": self._xml_text(dev, "dynamic-password"),
+                    # SHA256 of the currently configured door PIN (server-side copy).
+                    "out_auth_code": self._xml_text(dev, "out-auth-code"),
+                    # Per-device key that also protects the P2P media stream.
+                    "data_encode_key": self._xml_text(dev, "data-encode-key"),
                 }
             )
         return devices
@@ -187,16 +223,15 @@ class BalterCloudClient:
                 "command": "get-subdev-list",
                 "flag": "tdkcloud",
                 "seq": 5,
-                "session": self._duplex_session,
+                "session": self._server_session,
                 "user-data": "",
                 "version": CLIENT_VERSION,
             },
         }
-        url = f"https://{API_HOST}/auth/user;jus_duplex=up"
         async with self._session.post(
-            url,
+            self._base,
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json;charset=utf-8", **self._cookie_header()},
+            headers=self._headers("application/json;charset=utf-8"),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -206,9 +241,16 @@ class BalterCloudClient:
 
         locks = []
         for entry in data.get("content", []):
-            if entry.get("duid") != duid:
-                continue
-            for sub in entry.get("sub-devlist", []):
+            sub_devlist = entry.get("sub-devlist", [])
+            # The device reports 16 lock sub-devices (8 channels x 2 locks) regardless of
+            # what is physically wired. Only channels marked enabled correspond to a real
+            # door station, so restrict the locks we surface to those channels.
+            enabled_doors = {
+                sub.get("id")
+                for sub in sub_devlist
+                if sub.get("type") == "chn" and sub.get("enable")
+            }
+            for sub in sub_devlist:
                 if sub.get("type") != "lock" or not sub.get("enable"):
                     continue
                 code = sub.get("code", "")
@@ -218,6 +260,8 @@ class BalterCloudClient:
                     door = int(chn_part.replace("lock_chn", ""))
                     locknumber = int(lock_part)
                 except (ValueError, IndexError):
+                    continue
+                if enabled_doors and door not in enabled_doors:
                     continue
                 locks.append(
                     {
@@ -249,14 +293,11 @@ class BalterCloudClient:
             "<command>set.device.opendoor</command>"
             "</envelope>"
         )
-        url = f"https://{API_HOST}/tdkcgi"
+        url = f"https://{HOST}/tdkcgi"
         async with self._session.post(
             url,
             data=body.encode("utf-8"),
-            headers={
-                "Content-Type": "application/xml; charset=UTF-8",
-                **self._cookie_header(),
-            },
+            headers=self._headers("application/xml; charset=UTF-8"),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
             self._remember_cookie(resp)
@@ -271,6 +312,17 @@ class BalterCloudClient:
 
     # --------------------------------------------------------------- helpers
 
-    async def ensure_logged_in(self) -> None:
-        if not self._jsessionid:
-            await self.login()
+    async def get_dynamic_password(self, duid: str) -> str:
+        """Return a fresh rotating device password for one device.
+
+        Re-authenticates first: the servlet session can expire sooner than the device
+        password (which is valid ~1 week), and login is only two cheap requests, so a
+        fresh login before every unlock keeps the call reliable.
+        """
+        await self.login()
+        for device in await self.get_device_list():
+            if device["duid"] == duid:
+                if not device["dynamic_password"]:
+                    raise BalterApiError(f"No dynamic password for device {duid}")
+                return device["dynamic_password"]
+        raise BalterApiError(f"Device {duid} no longer listed on the account")

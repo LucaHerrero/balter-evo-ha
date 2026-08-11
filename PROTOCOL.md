@@ -8,8 +8,11 @@ Alle Werte unten sind **Platzhalter** – die tatsächlichen Werte (E-Mail, Pass
 
 ## Login
 
+**Zwei-Schritt-Ablauf (wichtig):** Der Login-POST liefert `404`, solange keine Servlet-Session existiert. Daher **zuerst** ein einfacher `GET /auth/user`, der per `Set-Cookie: jsessionid=...` eine anonyme Session vergibt, **dann** der Login-POST mit diesem Cookie. Der Login-POST geht an den **schlichten** Pfad `/auth/user` – **nicht** an `/auth/user;jus_duplex=up` (das ist ein Duplex-Long-Poll-Tunnel, der nur leere ACKs zurückgibt; die eigentliche Antwort käme dort asynchron über den parallel offen gehaltenen `;jus_duplex=down`-Kanal).
+
 ```
-POST /auth/user;jus_duplex=up HTTP/1.1
+1) GET /auth/user            -> Set-Cookie: jsessionid=...
+2) POST /auth/user HTTP/1.1   (mit Cookie: jsessionid=...)
 Content-Type: application/xml
 Host: r1-8.qvcloud.net
 
@@ -29,33 +32,40 @@ Host: r1-8.qvcloud.net
 </envelope>
 ```
 
-Antwort enthält `Set-Cookie: jsessionid=...` – dieser Cookie wird für alle folgenden Aufrufe benötigt (klassische Servlet-Session).
+Antwort (synchron im POST-Body): `<envelope><header>...<session><id>..</id></session><result>0</result></header><content><account-id>..</account-id>...</content></envelope>`. Dazu `Set-Cookie: jsessionid=...` – dieser Cookie wird für alle folgenden Aufrufe benötigt (klassische Servlet-Session). Die `<session><id>` wird zusätzlich in den `<header><session>` der Folgeaufrufe gespiegelt.
 
-**Bekannte Einschränkung:** Der Login-Request funktioniert nachweislich innerhalb der echten App (per Traffic-Capture verifiziert), schlägt aber bei Nachbau mit einem einfachen HTTP-Client (curl/aiohttp) mit `404` fehl – auch nach Hinzufügen des in der App gebündelten Client-Zertifikats (Mutual TLS, siehe unten) und passendem `User-Agent`. Vermutlich spielt TLS-Fingerprinting (JA3) oder eine Verbindungs-Reihenfolge-Abhängigkeit (z. B. vorheriger Location-/OAuth-Call auf derselben TCP-Verbindung) eine Rolle. **Wer das löst, bitte per Pull Request beitragen.**
+**GELÖST (früher „404"-Blocker):** Der Nachbau mit einem einfachen HTTP-Client (curl/aiohttp) funktioniert vollständig. Der 404 lag **ausschließlich** an der fehlenden Vorab-Session: ohne den einleitenden `GET /auth/user` (der die anonyme `jsessionid` vergibt) und/oder beim POST an den `;jus_duplex=up`-Tunnelpfad antwortet der Knoten mit 404. Mit `GET` → dann `POST /auth/user` (schlicht) klappt Login, Geräteliste, Sub-Geräte und Türöffnen synchron. **Kein Client-Zertifikat, kein JA3-Workaround nötig** – der TLS-Handshake eines Standard-Python-Clients wird akzeptiert, das gebündelte mTLS-Cert ändert am Ergebnis nichts. Verifiziert am 2026-08-11 gegen `r1-8.qvcloud.net`.
 
-Die App bündelt außerdem ein Client-Zertifikat für mTLS (`assets/client.pem` + `assets/client.txt` als privater Schlüssel, ausgestellt von "QUALVISION TECHNOLOGY CO.,LTD"). Ob dieses für die Cloud-API zwingend nötig ist, ist nicht abschließend geklärt.
+Die App bündelt zwar ein Client-Zertifikat für mTLS (`assets/client.pem` + `assets/client.txt`, ausgestellt von „QUALVISION TECHNOLOGY CO.,LTD"), dieses ist für die Cloud-API aber **nicht erforderlich**.
 
 ## Geräteliste
 
 ```
-POST /auth/user;jus_duplex=up  (Content-Type: application/xml, Cookie: jsessionid=...)
+POST /auth/user  (Content-Type: application/xml, Cookie: jsessionid=...)
 
 <content class="com.quvii.qvweb.userauth.bean.request.DevListReqContent">...</content>
 <header>...<command>get-device-list</command><flag>tdkcloud</flag>...</header>
 ```
 
-Antwort liefert pro Gerät `<id>` (duid), `<dynamic-password>` (rotierendes Geräte-Passwort, ca. 1 Woche gültig), `<out-auth-code>` (SHA256 der aktuellen Tür-PIN).
+Antwort liefert pro Gerät u.a.:
+- `<id>` (duid), `<model>` (z. B. `IDS9459AW`), `<name>`, `<channel-num>`
+- `<dynamic-password>` (rotierendes Geräte-Passwort, ca. 1 Woche gültig, `<password-expired>` nennt das Ablaufdatum)
+- `<out-auth-code>` (SHA256 der aktuellen Tür-PIN), `<default-out-auth-code>` (Werks-PIN im Klartext)
+- `<data-encode-key>` (32-Zeichen-Geräteschlüssel – **starker Kandidat für die Ver-/Entschlüsselung des P2P-Medienstroms**, siehe „Video")
+- `<transparent-basedata>` (base64, Geräte-Roh-Konfig)
 
 ## Sub-Geräte (Kanäle/Schlösser)
 
 ```json
-POST /auth/user;jus_duplex=up  (Content-Type: application/json)
+POST /auth/user  (Content-Type: application/json)
 {"content":{"duids":["{duid}"]},"header":{...,"command":"get-subdev-list","flag":"tdkcloud",...}}
 ```
 
-Liefert pro Kanal zwei Schlösser (`lock_chn{N} 1`, `lock_chn{N} 2` → `door={N}`, `locknumber=1|2`).
+Liefert `chn`-Einträge (`CAM1..4` = Türstationen, `CCTV1..8` = Kameras, je mit `enable`) und `lock`-Einträge. Pro Kanal zwei Schlösser (`lock_chn{N} 1`, `lock_chn{N} 2` → `door={N}`, `locknumber=1|2`), insgesamt 16. Nur Schlösser unter einem `enable:1`-Kanal entsprechen einer real verdrahteten Tür (hier nur `CAM1`/`door=1`).
 
 ## Tür öffnen (verifiziert funktionierend)
+
+Auf demselben Host/derselben Session wie der Login (`jsessionid`-Cookie):
 
 ```
 POST /tdkcgi HTTP/1.1
@@ -80,4 +90,16 @@ Erfolgsantwort: `<envelope><body><error>0</error><content></content></body></env
 
 ## Video
 
-**Nicht implementiert.** Der Live-Videostream läuft über ein separates, proprietäres P2P-Binärprotokoll über UDP (Magic-Header `C1 EF AB FF`, eigene Sequenzierung/ACK-Schicht) direkt zwischen App und Gerät (NAT-Hole-Punching), nicht über die HTTPS-API. Ob die Nutzdaten darin verschlüsselt sind, ist ungeklärt. Eine Umsetzung würde eine vollständige Reimplementierung dieses Binärprotokolls erfordern (natives SDK: `libqv-p2p-v2.so`, `liblive_player.so`).
+**Nicht implementiert.** Der Live-Videostream läuft über ein separates, proprietäres P2P-Binärprotokoll über UDP (Magic-Header `C1 EF AB FF`, eigene Sequenzierung/ACK-Schicht) direkt zwischen App und Gerät (NAT-Hole-Punching), nicht über die HTTPS-API. Eine Umsetzung würde eine Reimplementierung dieses Binärprotokolls erfordern (natives SDK: `libqv-p2p-v2.so`, `liblive_player.so`).
+
+**Zwei getrennte Kanäle im P2P-Tunnel (Frida-verifiziert, 2026-08-11):**
+
+1. **Steuer-/Signalisierungskanal → AES-256-CBC.** `liblive_player.so` ruft `AES_set_encrypt_key`/`AES_set_decrypt_key` (256 bit) mit exakt dem `<data-encode-key>` aus der Cloud-Geräteliste auf (32 ASCII-Bytes, nicht base64-dekodiert) und ver-/entschlüsselt über `AES_cbc_encrypt` mit **festem IV `"0000000000000000"`** (`0x30`×16). Nutzdaten sind klein und 16-Byte-blockaligned (32/48/80/240 …, hunderte kurze Blöcke/s) – also Kontroll-/Reliability-Nachrichten, **kein Video**.
+
+2. **Bulk-Video → unverschlüsselt.** Der eigentliche Videostrom ist **nicht** AES-verschlüsselt (`libqv-p2p-v2.so!AES_cbc_encrypt` mit enc=0: **0 Aufrufe** während des Streams). Nach der P2P-Reliability-Schicht liegt der Strom direkt als **H.264 (Annex-B)** vor.
+
+**Video End-to-End verifiziert:** Am FFmpeg-Eintritt `libavcodec.so!avcodec_send_packet` (`AVPacket->data`@Offset 24, `->size`@32) wurden die Access-Units gedumpt (10 s ≈ 126 Pakete / 341 KB ≈ 34 KB/s). `ffprobe` erkennt den Rohstrom als **H.264, Profile Main, 352×280, yuv420p**; NAL-Folge SPS/PPS/IDR + P-Frames, 126 Frames dekodiert und zu MP4/JPG gerendert (zeigt das reale Türstations-Kamerabild). Skript: `scratchpad/frida_dumpvideo.py`.
+
+**Konsequenz für Standalone-Video:** Kein Krypto-Problem mehr – es fehlt nur noch die Reimplementierung des `C1EFABFF`-**Transports** (Session-Handshake, NAT-Hole-Punching, ACK/Reliability in `libqv-p2p-v2.so`), um die H.264-Access-Units ohne App zu empfangen. Der AES-256-CBC-Key/IV oben wird nur für die begleitenden Steuernachrichten dieses Transports gebraucht.
+
+Pragmatische Alternative bis dahin: eingeloggtes Android-Gerät als Brücke – entweder ADB-Screencapture des Live-Bilds **oder** ein Frida-Tap auf `avcodec_send_packet`, der die H.264-Access-Units live an Home Assistant weiterreicht (RTSP/Snapshot). Türöffnen läuft bereits vollständig über die Cloud-API.
