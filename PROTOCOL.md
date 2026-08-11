@@ -95,7 +95,7 @@ token: <JWT>
 
 liefert `HTTP 200 {"result":3,"message":"...iotserver...设备未注册"}` = **„Gerät nicht registriert"**. Der Endpunkt akzeptiert Auth+Format, aber dieses Gerät (`IDS9459AW`) ist auf der IoT-/MQTT-Steuerebene nicht registriert – es läuft ausschließlich über die P2P/NetSDK-Schiene.
 
-**Fazit:** Türöffnen erfordert – wie das Video – den **P2P-Tunnel** (`libqv-p2p-v2.so`). Ohne dessen Reimplementierung ist Standalone-Unlock nicht möglich; als Brücke bleibt ein eingeloggtes Android-Gerät (ADB-Tap auf den Entriegeln-Button der App).
+**Fazit:** Türöffnen erfordert – wie das Video – den **P2P-Tunnel** (`libqv-p2p-v2.so`). Ohne dessen Reimplementierung ist Standalone-Unlock nicht möglich; als Brücke bleibt ein eingeloggtes Android-Gerät (ADB-Tap auf den Entriegeln-Button der App). Der Transport ist inzwischen aus einem echten Session-Mitschnitt weitgehend rekonstruiert – siehe **[`P2P_PROTOCOL.md`](P2P_PROTOCOL.md)**.
 
 Nebenbefund: `/openapi-tdk/client/push/token` registriert einen **FCM-Push-Token** – Klingel-/Ruf-Events kommen also per FCM-Push (potenziell als HA-Event nutzbar).
 
