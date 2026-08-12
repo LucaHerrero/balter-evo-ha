@@ -26,8 +26,8 @@ Die Auswertung braucht kein Telefon mehr – `tools/p2p_decode.py` liest das pca
 | Rolle | Adresse (Beispiel-Session) | Bemerkung |
 |---|---|---|
 | Client (Telefon) | `192.168.0.184:56775` | dynamischer Quellport |
-| Gerät (Klingel, Elternhaus) | `146.52.36.168:45269` | öffentliche IP + dyn. Port, per NAT-Hole-Punch direkt erreicht |
-| Gerät im Eltern-LAN | `192.168.178.143:45269` | **private** Adresse – der Client punched parallel dorthin (ICE-artig) |
+| Gerät (Klingel) | `<WAN-IP>:45269` | öffentliche IP + dyn. Port, per NAT-Hole-Punch direkt erreicht (Adresse redigiert) |
+| Gerät im lokalen LAN | `192.168.178.143:45269` | **private** Adresse (RFC1918) – der Client punched parallel dorthin (ICE-artig) |
 | Rendezvous-Server | `195.154.119.43:15017` | Scaleway Paris; nur für den Hole-Punch, **kein** Video-Relay |
 
 Der gesamte **Video-Bulk (1,79 MB/30 s) läuft direkt Gerät→Telefon**. Dass der Client die *private* Adresse des Geräts mitprobiert, beweist: er bekommt Kandidatenadressen (privat + öffentlich) vorab von der Cloud oder vom Rendezvous-Server geliefert.
@@ -235,6 +235,35 @@ Gefunden per Frida-Hook auf `liblive_player.so!SHA256_Final`: Der Digest jedes A
 4. **Stream-Start-Kommando** (optional, für Live-Video in HA): die zwei Vorbereitungs-Frames (`plen=48`, Typ `0xFE`) vor dem Öffnen semantisch zuordnen.
 
 Der **Türöffner** braucht nur 1–3 (kein Video). Die Krypto- und Kommando-Schicht (Frame bauen, verschlüsseln, Trailer) ist fertig und in `tools/p2p_decode.py` implementiert.
+
+## 7a. Verbindungsaufbau: MQTT-Discovery + KCP — *bestätigt (Frida)*
+
+Der Verbindungsaufbau wurde per Frida-Hook auf `libqv-p2p-v2.so!SSL_write/SSL_read` (die App-eigene MQTT-Implementierung `tdkcloud::MqttSession`) beim App-Start vollständig erfasst. Wichtig: **Frida `spawn`** nötig – die Signalisierung läuft direkt nach dem Start, ein späteres `attach` verpasst sie.
+
+**1. MQTT-Verbindung** zum Broker `mqttsr1.qvcloud.net` (TLS):
+- Protokoll `MQIsdp` (MQTT 3.1), Client-ID `app_<cli-id>_<user-id>_`
+- Username `B_<cli-id>`, **Password = RS256-JWT** (Payload: `cli-id`, `cli-type:app`, `exp`, `oem-group:G0028,G0126`, `qv-rgn:1`) – vom Server signiert, aus einem Cloud-Call geholt (Herkunft noch zu bestätigen, vermutlich `/qvoauthv2/token`).
+- Publish-Topic `app/ust/json/<cli-id>`, Subscribe-Topic `<cli-id>/ust/json`. Nutzlast ist JSON mit `header.command` + `content`.
+
+**2. Signalisierungs-Kommandos** (JSON über MQTT):
+- `register` → Broker bestätigt (`heartbeat.interval`, `MqttKeepAliveSec`).
+- `sub-device-state` (mit `devid`) → Online-Status des Geräts.
+- **`p2pconnect`** (Client → Gerät): trägt `devid`, eine selbst erzeugte **`session-flag`** (44-Zeichen-Token – identisch mit dem Token im UDP-INIT, §4c), `requ-session-id` (zufällige int32) und die **`kcpParam`** (s. u.).
+- `update-netinfo` (Client → Gerät): eigene `pub-ip`/`pub-udpport` + `loc-ip`/`loc-udp-port`.
+- **`p2pconnect`-Antwort** (Gerät → Client): liefert **alle Adress-Kandidaten**:
+  - `loc-ip` + `loc-udpport` — LAN-Adresse des Geräts
+  - `pub-ip` + `pub-udpport` — WAN-Adresse (NAT-Außenseite)
+  - `utd-pub-ip` + `utd-pub-udpport` — Rendezvous-/Relay-Server (die Scaleway-IP aus §2)
+  - `resp-session-id` (= `requ-session-id`), `session-flag`, `dest-port`, `kcpParam`.
+
+Der Client punched dann UDP-INIT (§4c) mit der `session-flag` parallel an `loc`, `pub` und `utd` – exakt die drei Ziele aus dem Session-Mitschnitt.
+
+**3. Transport = KCP.** Die `kcpParam` sind 1:1 die Konfiguration von **KCP** (github.com/skywind3000/kcp): `mode`, `sndwnd`, `rcvwnd`, `nodelay`, `interval`, `resend`, `nc`, `rto`, `fastresend`, `mtu:1200`, `kcpVersion:v1.0`. Das erklärt das seq/ack/Window-ARQ des `C1EFABFF`-Protokolls: Es ist ein **KCP-Derivat mit eigenem 28-B-Wire-Header** (Standard-KCP hat 24 B: conv/cmd/frg/wnd/ts/sn/una/len – die genaue Zuordnung zum 28-B-Header aus §4a ist der nächste Verifikationsschritt).
+
+**Damit ist der komplette Weg zum eigenständigen Türöffner kartiert:**
+Cloud-Login → `get-device-list` (duid, `data-encode-key`, `dynamic-password`, PIN-Hash) → JWT holen → MQTT-`p2pconnect` (Adressen + `session-flag`) → UDP-Hole-Punch → KCP-Session → Öffnen-Frame (AES + SHA256-Trailer) senden.
+
+**Verbleibende Implementierungs-Unbekannte:** (a) welcher Cloud-Call den JWT liefert, (b) das genaue 164-B-INIT-Wire-Format, (c) die Zuordnung 28-B-Header ↔ KCP-Segment, (d) die Header-Prüfsumme (§7 Punkt 2).
 
 ## 8. Artefakte
 
