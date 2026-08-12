@@ -140,6 +140,14 @@ def _cbc(buf, key):
     return d.update(buf[:n]) + d.finalize()
 
 
+def _cbc_enc(buf, key):
+    n = (len(buf) // 16) * 16
+    if n < 16:
+        return b""
+    e = Cipher(algorithms.AES(key), modes.CBC(IV)).encryptor()
+    return e.update(buf[:n]) + e.finalize()
+
+
 def decrypt_head(body, key):
     """Nur die ersten ENC_LEN Bytes sind AES-256-CBC; der Rest ist Klartext.
 
@@ -194,6 +202,43 @@ def verify_trailer(head, nutzteil):
     payload = nutzteil[:clen]
     trailer = nutzteil[clen:clen + 32]
     return frame_trailer(head, payload) == trailer, payload, trailer
+
+
+def build_control_frame(ftype, timestamp, msg_id, payload, key):
+    """Baut einen kompletten (verschluesselten) Steuerframe-Body.
+
+    Gegenstueck zu decrypt_control(): Kopf-Segment (32 B) + Nutzteil-Segment
+    (payload ++ SHA256-Trailer, auf 16 gepaddet), beide AES-256-CBC (IV="0"*16).
+    Verifiziert: reproduziert den aufgezeichneten Tueroeffnen-Frame bit-genau.
+
+    payload = Kommando-Bytes OHNE Trailer.
+    """
+    clen = len(payload)
+    plen = clen + 32
+    head = bytearray(32)
+    head[0] = ftype                              # 0xFE = Steuerung
+    struct.pack_into("<I", head, 1, timestamp)   # Unix-Sekunden
+    head[9] = plen                               # verschluesselte Nutzteillaenge
+    head[11] = clen                              # Payload ohne Trailer
+    head[13] = msg_id
+    trailer = frame_trailer(head, payload)
+    nutzteil = bytes(payload) + trailer
+    if len(nutzteil) % 16:
+        nutzteil += b"\x00" * (16 - len(nutzteil) % 16)
+    return _cbc_enc(bytes(head), key) + _cbc_enc(nutzteil, key)
+
+
+def build_open_payload(door, locknumber, pin_sha256_hex):
+    """Nutzteil-Payload des Tueroeffnen-Kommandos (16 B Parameter + 64 B PIN-Hash).
+
+    door/locknumber wie im Cloud-CGI set.device.opendoor; pin_sha256_hex ist
+    SHA256(Tuer-PIN) als 64 Hex-Zeichen (= out-auth-code der Cloud-Geraeteliste).
+    """
+    p = bytearray(16)
+    p[0] = door
+    p[2] = locknumber
+    p[3] = 1                                     # Aktion = entriegeln
+    return bytes(p) + pin_sha256_hex.encode("ascii")
 
 
 def media_info(plain):
