@@ -173,6 +173,29 @@ def decrypt_control(body, key):
     return head, _cbc(payct, key)
 
 
+def frame_trailer(head, payload):
+    """Integritaets-Trailer eines Steuerframes: SHA256(Kopf[32] ++ Payload).
+
+    Der Trailer ist KEINE geheime Signatur, sondern eine schlichte Pruefsumme
+    ueber die (entschluesselten) Frame-Daten. Er ist damit ohne Geheimnis
+    berechenbar -- Voraussetzung fuer einen eigenstaendigen Client.
+    """
+    import hashlib
+    return hashlib.sha256(bytes(head[:32]) + bytes(payload)).digest()
+
+
+def verify_trailer(head, nutzteil):
+    """Prueft den Trailer eines entschluesselten Steuerframe-Nutzteils.
+
+    Nutzteil = payload[:clen] ++ trailer[32], clen = Kopf[11].
+    Liefert (ok, payload, trailer).
+    """
+    clen = head[11]
+    payload = nutzteil[:clen]
+    trailer = nutzteil[clen:clen + 32]
+    return frame_trailer(head, payload) == trailer, payload, trailer
+
+
 def media_info(plain):
     """Kopf eines entschluesselten Medien-Frames deuten."""
     if len(plain) < 52:
@@ -323,13 +346,15 @@ def main():
             head, pay = decrypt_control(f[APP_HDR:], key)
             if len(head) < 14:
                 continue
-            hexpay = re.search(rb'[0-9a-f]{64}', pay)   # SHA256 als Hex-ASCII
+            ok, payload, _tr = verify_trailer(head, pay)
+            chk = "Trailer OK" if ok else "Trailer FEHLER"
+            hexpay = re.search(rb'[0-9a-f]{64}', payload)   # SHA256 als Hex-ASCII
             tag = ""
             if hexpay:
-                door, lock = pay[0], pay[2]
+                door, lock = payload[0], payload[2]
                 tag = (f"  <== TUEROEFFNEN door={door} locknumber={lock} "
                        f"pin_sha256={hexpay.group().decode()}")
-            print(f"  @{pos} typ={head[0]:#04x} plen={head[9]}{tag}")
+            print(f"  @{pos} typ={head[0]:#04x} plen={head[9]} [{chk}]{tag}")
 
     print(f"\nRendern:  ffmpeg -f h264 -r 17 -i {vpath} -c:v libx264 -pix_fmt yuv420p out.mp4")
 

@@ -191,15 +191,29 @@ Der Upstream trägt die Steuerkommandos als App-Frames mit Frame-Typ `0xFE`. Ein
 +03  uint8   ?            1  (vermutlich Aktion: 1 = entriegeln)
 +04  12 B    0
 +10  64 B    SHA256(Tür-PIN) als Hex-ASCII      <- clen deckt +00..+50 ab (16+64)
-+50  32 B    Trailer      Signatur/MAC, Ableitung noch offen
++50  32 B    Trailer      = SHA256(Kopf[32] ++ Payload[0..clen])
 ```
 
 Verifiziert: Der Hash im abgefangenen Frame ist exakt `SHA256(<Tür-PIN>)` – identisch mit dem Hash im Cloud-Pfad (`PROTOCOL.md`/Notes) und mit dem `out-auth-code` der Geräteliste. `door`/`locknumber` entsprechen den Feldern des Cloud-CGI `set.device.opendoor`. Das Kommando läuft also **nicht** über die Cloud, sondern durch den P2P-Tunnel – wie in 5h vorhergesagt.
 
 `tools/p2p_decode.py` erkennt das automatisch und gibt aus (Hash hier gekürzt):
-`@900 typ=0xfe plen=112  <== TUEROEFFNEN door=1 locknumber=1 pin_sha256=<64 hex>`
+`@900 typ=0xfe plen=112 [Trailer OK]  <== TUEROEFFNEN door=1 locknumber=1 pin_sha256=<64 hex>`
 
-**Offen:** Der 32-B-Trailer (Feld `+50`) ist kein naheliegender Hash (getestet: SHA256 über param/hash/key/Kombinationen – kein Treffer). Vermutlich HMAC oder Signatur mit einem Session-Geheimnis (dynamic-password?). Für einen eigenständigen Öffner muss dessen Ableitung noch geklärt werden – das ist der letzte fehlende Baustein.
+### 6a. Trailer / Integritäts-Prüfsumme — *bestätigt (Frida)*
+
+Der 32-B-Trailer am Ende jedes Steuerframe-Nutzteils ist **keine geheime Signatur**, sondern schlicht:
+
+```
+Trailer = SHA256( Kopf[0..32]  ++  Payload[0..clen] )
+```
+
+d. h. SHA256 über die **entschlüsselten** 32 Kopf-Bytes gefolgt vom Kommando-Payload (ohne den Trailer selbst). Kein HMAC, kein Schlüssel, kein Nonce – nur die Frame-Daten.
+
+Gefunden per Frida-Hook auf `liblive_player.so!SHA256_Final`: Der Digest jedes Aufrufs taucht unmittelbar danach im Klartext-Input von `AES_cbc_encrypt(enc=1)` als Trailer auf. Der Input von `SHA256_Final` ist exakt `Kopf ++ Payload`.
+
+**Offline bit-genau verifiziert** gegen `open.pcap`: `SHA256(Kopf ++ Payload)` reproduziert den Trailer aller vier aufgezeichneten Steuerframes (`tools/p2p_decode.py` → `verify_trailer()`, Ausgabe `[Trailer OK]`).
+
+**Konsequenz:** Der Trailer ist **ohne jedes Geheimnis berechenbar**. Für einen eigenständigen Öffner genügen der `data-encode-key` (Verschlüsselung) und die Tür-PIN (deren SHA256 im Payload steht) – beide stehen in der Cloud-Geräteliste. Es fehlt damit **kein kryptografischer Baustein** mehr; offen ist nur noch die Transport-/Sende-Schicht (§7).
 
 ## 7. Bestätigt vs. offen
 
@@ -212,13 +226,15 @@ Verifiziert: Der Hash im abgefangenen Frame ist exakt `SHA256(<Tür-PIN>)` – i
 - **Video vollständig rekonstruiert:** 505 Frames, 352×280, H.264 Main, gerendert und visuell verifiziert (Fisheye-Bild der Türstation).
 - Steuerkanal-Payload ist JSON (Sub-Geräteliste im Klartext gelesen).
 - **Türöffnen-Kommando entschlüsselt:** Upstream-Steuerframe Typ `0xFE`, Nutzteil `door`/`locknumber` + `SHA256(<Tür-PIN>)` (Hex-ASCII); Hash gegen die bekannte PIN verifiziert.
+- **Trailer geknackt:** `SHA256(Kopf ++ Payload)`, keine geheime Signatur, für alle vier aufgezeichneten Steuerframes bit-genau reproduziert (§6a). Damit ist die **gesamte Krypto-/Kommando-Ebene vollständig** und ohne Geheimnis nachbaubar.
 
-**Offen / nächste Schritte für eine eigenständige Implementierung:**
-1. **Öffnen-Trailer (32 B):** die Signatur/MAC am Ende des Kommandos ableiten – ohne sie akzeptiert das Gerät ein selbstgebautes Kommando vermutlich nicht. Kandidaten: HMAC mit `dynamic-password` oder dem INIT-Token. **Wichtigster verbleibender Baustein für den Standalone-Türöffner.**
-2. **Stream-Start-Kommando:** die zwei Vorbereitungs-Frames (`plen=48`, Typ `0xFE`) vor dem Öffnen semantisch zuordnen; analog für „Live Kanal 1 starten".
-3. **Adress-Discovery:** Woher bekommt der Client die WAN/LAN-Kandidaten und die Rendezvous-Adresse? Vermutlich ein Cloud-Call vor dem Punch – noch mitzuschneiden (TLS, daher Frida `SSL_write` beim Verbindungsaufbau).
-4. **Prüfsumme (Transport-Feld 6, untere 16 Bit):** Algorithmus unbekannt. Für einen eigenen Client nötig, sofern das Gerät sie prüft.
-5. **Sende-Seite:** ARQ/Retransmit-Timing und Fensterlogik nachbauen.
+**Offen / nächste Schritte – nur noch die Transport-Sendeseite:**
+1. **Adress-Discovery:** Woher bekommt der Client die WAN/LAN-Kandidaten des Geräts und die Rendezvous-Adresse? Vermutlich ein Cloud-Call vor dem Punch – per Frida `SSL_write` beim Verbindungsaufbau mitzuschneiden. **Wichtigster verbleibender Baustein.**
+2. **Prüfsumme (Transport-Feld 6, untere 16 Bit):** Algorithmus unbekannt. Für einen eigenen Client nötig, sofern das Gerät sie prüft. (Kandidat: CRC16 über den 28-B-Header.)
+3. **Sende-Seite:** NAT-Hole-Punch (164-B-INIT parallel an die Kandidaten), Verbindungs-ID-Vergabe, seq/ack-ARQ, Fensterlogik, Retransmit-Timing.
+4. **Stream-Start-Kommando** (optional, für Live-Video in HA): die zwei Vorbereitungs-Frames (`plen=48`, Typ `0xFE`) vor dem Öffnen semantisch zuordnen.
+
+Der **Türöffner** braucht nur 1–3 (kein Video). Die Krypto- und Kommando-Schicht (Frame bauen, verschlüsseln, Trailer) ist fertig und in `tools/p2p_decode.py` implementiert.
 
 ## 8. Artefakte
 
