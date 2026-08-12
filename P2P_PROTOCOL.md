@@ -57,9 +57,11 @@ Alle Pakete beginnen mit dem 4-Byte-Magic **`C1 EF AB FF`** (LE-uint32 `0xFFABEF
 | 3 | 12 | LE-uint32 | **seq** – Byte-Offset im *eigenen* Sendestrom |
 | 4 | 16 | LE-uint32 | **ack** – bisher lückenlos empfangener Byte-Offset des *Gegenstroms* |
 | 5 | 20 | LE-uint32 | Empfangsfenster (typ. `0x1900` = 6400) |
-| 6 | 24 | 2× LE-uint16 | `[0..1]` Prüfsumme, `[2..3]` **Gesamtlänge des UDP-Payloads** |
+| 6 | 24 | 2× LE-uint16 | `[0..1]` **Rest-Bytes** der aktuellen Nachricht, `[2..3]` **Gesamtlänge des UDP-Payloads** |
 
-> **Korrektur gegenüber früheren Fassungen dieses Dokuments:** Feld 3 ist der Sende-Offset und Feld 4 die ACK-Nummer – nicht „Offset bzw. msg-id". Der scheinbar konstante Wert `0x1ED` in Feld 4 war schlicht die ACK-Nummer 493 in der Anfangsphase. Feld 6 ist keine reine Prüfsumme, sondern enthält in den oberen 16 Bit die Paketlänge.
+> **Korrektur gegenüber früheren Fassungen dieses Dokuments:** Feld 3 ist der Sende-Offset und Feld 4 die ACK-Nummer – nicht „Offset bzw. msg-id". Der scheinbar konstante Wert `0x1ED` in Feld 4 war schlicht die ACK-Nummer 493 in der Anfangsphase.
+>
+> **Feld 6, untere 16 Bit ist KEINE Prüfsumme.** Empirisch (session.pcap): `f6_low + seq = konstant` über einen ganzen Nachrichten-Burst (z. B. `0x6DC5`), d. h. `f6_low = Nachrichtenende_Offset − seq` = **verbleibende Bytes der aktuellen Nachricht**, deterministisch. Es gibt also **keine kryptografische Header-Prüfsumme** – der gesamte 28-B-Header ist ohne Geheimnis berechenbar. (Bei Kontroll-/INIT-Paketen ist f6_low = 0.)
 
 Damit ist die Transportschicht **TCP über UDP**: fortlaufende Byte-Offsets, kumulative ACKs, Retransmits mit identischem Offset. Datenpakete tragen bis zu 1420 B Payload (1448 B UDP gesamt), reine ACKs sind 28 B ohne Payload.
 
@@ -81,12 +83,23 @@ Als zwei LE-uint16 gelesen, sind beide Hälften **schlichte Zähler**, die pro n
 Das Telefon sendet dieses Paket zu Session-Beginn **gleichzeitig** an Rendezvous-Server, Geräte-WAN- und Geräte-LAN-Adresse; die Gegenstellen echoen es zurück (NAT-Loch öffnen).
 
 ```
-c1efabff 00000000 00000000 00000000 00000000 00000000 0000 a400   <- Transport-Header, IDs = 0
-ffffffff 88000000 …                                              <- App-Frame (siehe §5)
-00 01 00 00 …                                                    <- Byte @0x2e: 0 = Anfrage, 1 = Antwort
-… 88f6a602 …                                                     <- Transaktions-Nonce (Echo trägt ihn zurück)
-… 767674 33646a68…                                               <- 38-Zeichen-Token (Stream-Key)
+0x00  c1efabff              Magic
+0x04  00000000 00000000     src-id / dst-id = 0 (noch keine Session)
+0x1a  a400                  len16 = 164
+0x1c  ffffffff              „no session"-Marker
+0x20  88000000              App-Frame, Typ 0x88 (CONNECT)
+0x2e  0001 0000 0200 1200   konstante Handshake-Felder (Byte @0x2e: 0=Anfrage/1=Antwort)
+0x40  60000000              Body-Länge 0x60 = 96
+0x44  <session-flag>        Token (ASCII, ~44–62 Zeichen) – identisch mit MQTT `session-flag` (§7a)
+0x8c  "192.168.178.143\0"   Ziel-loc-ip als ASCII-String
+0x9c  d5b0                  loc-udpport = 0xB0D5 = 45269 (LE-uint16)
 ```
+
+Der **Hole-Punch-Ablauf** (aus `open.pcap`, chronologisch):
+1. **STUN-artige Vorphase** zu einem Init-/STUN-Server (`8.211.5.8`): 8× 96–112-B-Pakete (`ffffffff 54…`/`44…`) – vermutlich zur Ermittlung der eigenen `pub-ip`/`pub-udpport` (fließt dann in MQTT-`update-netinfo`, §7a).
+2. **INIT parallel** (Typ `0x88`) an `loc-ip`, `pub-ip` und `utd-pub-ip` – exakt die drei Kandidaten aus der `p2pconnect`-Antwort.
+3. Gegenstellen **echoen** das INIT (Byte @0x2e = 1); Retransmits bis der Punch steht.
+4. Danach laufen die Datenpakete mit den etablierten `src`/`dst`-IDs (hier `01000000`/`83000000`).
 
 - Der Token (`vvt3djhrescpxvvudoyyaeui8owkmwigxpnlgmj`) ist die Session-Kennung und entspricht dem CGI `get.device.streamkey`.
 - **Korrektur:** Das früher als „Pakettyp `88`" beschriebene Byte ist in Wahrheit das erste Byte der **App-Frame-Länge** (`0x88` = 136). Es gibt an dieser Stelle kein Typfeld.
@@ -263,7 +276,7 @@ Der Client punched dann UDP-INIT (§4c) mit der `session-flag` parallel an `loc`
 **Damit ist der komplette Weg zum eigenständigen Türöffner kartiert:**
 Cloud-Login → `get-device-list` (duid, `data-encode-key`, `dynamic-password`, PIN-Hash) → JWT holen → MQTT-`p2pconnect` (Adressen + `session-flag`) → UDP-Hole-Punch → KCP-Session → Öffnen-Frame (AES + SHA256-Trailer) senden.
 
-**Verbleibende Implementierungs-Unbekannte:** (a) welcher Cloud-Call den JWT liefert, (b) das genaue 164-B-INIT-Wire-Format, (c) die Zuordnung 28-B-Header ↔ KCP-Segment, (d) die Header-Prüfsumme (§7 Punkt 2).
+**Verbleibende Implementierungs-Unbekannte** (Stand nach der Wire-Analyse): nur noch **(a) welcher Cloud-Call den JWT liefert** und **(b) der genaue STUN-Austausch mit dem Init-Server** (`8.211.5.8`, Typ `0x54`/`0x44`) zur eigenen `pub-ip`. Das INIT-Format (§4c), die Header-Semantik (§4a – inkl. „keine Prüfsumme") und der Öffnen-Frame sind vollständig geklärt. Für den Öffner genügt notfalls die eigene LAN-Adresse in `update-netinfo` (der Rendezvous `utd-pub-ip` ermittelt die WAN-Adresse aus dem eintreffenden UDP-Paket selbst).
 
 ## 8. Artefakte
 
