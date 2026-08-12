@@ -304,7 +304,14 @@ Ein reiner Python-Client (ohne App/Frida, nur `paho-mqtt` + `cryptography`) wurd
 
 **Session-Handshake** (aus `open.pcap`, verstanden): nach dem CONNECT sendet der Client einen 28-B-**SYN** (`src=0, dst=<client-id>`), das Gerät antwortet mit `src=<client-id>, dst=<device-id>, ack=1` (verrät seine ID), dann bestätigt der Client. Danach Datenpakete `src=<device-id>, dst=<client-id>`.
 
-**Offener Blocker:** Der **direkte NAT-Punch zum Gerät** gelang im Test nicht — nur der Rendezvous antwortet, das Gerät (WAN) punched trotz korrektem `update-netinfo` nicht direkt zurück. Damit fehlt der Datenpfad für den 28-B-SYN/die KCP-Datenphase. Ursache vermutlich NAT-Timing/-Symmetrie auf der Geräteseite; die App löst das (evtl. über Relay-Datenpfad oder präziseres Punch-Timing), der genaue Mechanismus des `utd`-Relays für **Nutzdaten** (nicht nur Signalisierung) ist noch offen. Der Öffnen-Frame selbst ist fertig (§6a, bit-genau); es fehlt nur der Transport zum Gerät.
+**Update (paketgenauer App-Vergleich):** Ein gleichzeitiger tcpdump+MQTT-Mitschnitt eines echten App-Öffnens zeigte, dass **auch die App keinen direkten Punch zum Gerät bekommt** – der **`utd`-Rendezvous ist ein voller Daten-Relay** (die gesamte Session, 1,09 MB, lief über ihn). Damit wurden die letzten Bausteine geknackt und **live gegen das echte Gerät verifiziert**:
+
+6. **Relay-Datenpfad:** Verkehr läuft über `utd-pub-ip:utd-pub-udpport`. ✅
+7. **Bidirektionaler CONNECT-Handshake:** eingehende INIT-`rf=0` müssen mit **`rf=1` geechot** werden (nicht nur selbst `rf=0` senden). ✅
+8. **Header-Prüfsumme = Internet-Checksum** (RFC 1071, aus `TDK_F_SYS_CheckSum` disassembliert): Ones-complement-Summe der 16-Bit-Wörter über den 28-B-Header, gefaltet, invertiert → Feld 6 `[csum | len]`. Erklärt rückwirkend „f6_lo+seq=konstant" (die Prüfsumme kompensiert seq). Kontrollpakete tragen `win_hi=0xffff`. ✅
+9. **KCP-Session-Handshake:** 28-B-SYN (`s=0,d=<client-id>`) → SYN-ACK (`s=<client-id>,d=<device-id>,ack=1`) → ACK. **Live etabliert** – das Gerät akzeptiert den SYN und **ackt anschließend meine Datenpakete** (BW-Test + Öffnen-Frame, `ack` läuft korrekt mit). ✅
+
+**Verbleibender Blocker:** Das Gerät **ackt** den Öffnen-Frame auf KCP-Ebene, **verarbeitet** ihn aber nicht auf App-Ebene und sendet keinen Downstream-Handshake — die **App-Session im Byte-Stream** wird nicht geöffnet (vermutlich fehlt der korrekte Stream-/Session-Start mit der aktuellen `session-flag` als Streamkey, oder Replay-Schutz gegen den 1:1 wiederholten Byte-Stream). Der eigenständige P2P-Client steht damit bis zur etablierten KCP-Session; es fehlt nur noch die App-Session-Eröffnung, damit `opendoor` greift.
 
 ## 8. Artefakte
 
