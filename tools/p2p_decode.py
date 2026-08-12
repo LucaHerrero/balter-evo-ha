@@ -132,13 +132,45 @@ def app_frames(buf):
     return out
 
 
+def _cbc(buf, key):
+    n = (len(buf) // 16) * 16
+    if n < 16:
+        return b""
+    d = Cipher(algorithms.AES(key), modes.CBC(IV)).decryptor()
+    return d.update(buf[:n]) + d.finalize()
+
+
 def decrypt_head(body, key):
-    """Nur die ersten ENC_LEN Bytes sind AES-256-CBC; der Rest ist Klartext."""
+    """Nur die ersten ENC_LEN Bytes sind AES-256-CBC; der Rest ist Klartext.
+
+    Das ist die schnelle Naeherung fuer Medien-Frames (Kopf 32 B + 32 B Nutzteil
+    = 64 B verschluesselt, danach Klartext-H.264). Fuer Steuerframes mit laengerem
+    Nutzteil siehe decrypt_control().
+    """
     n = min(ENC_LEN, (len(body) // 16) * 16)
     if n < 16:
         return body
     d = Cipher(algorithms.AES(key), modes.CBC(IV)).decryptor()
     return d.update(body[:n]) + d.finalize() + body[n:]
+
+
+def decrypt_control(body, key):
+    """Vollstaendige Frame-Entschluesselung nach der byte9-Regel.
+
+    Der Body besteht aus zwei separaten AES-256-CBC-Segmenten (je IV = "0"*16):
+      - Kopf:     Bytes 0..32  (Typ, Zeitstempel, Laengen)
+      - Nutzteil: Bytes 32..32+plen, wobei plen = Kopf[9]
+    Bei Medien-Frames ist plen = 32 (=> 64 B insgesamt, wie decrypt_head).
+    Bei Steuerframes (z.B. Tueroeffnen) ist plen groesser.
+
+    Liefert (kopf, nutzteil) als entschluesselte Bytes.
+    """
+    head = _cbc(body[:32], key)
+    if len(head) < 32:
+        return head, b""
+    plen = head[9]
+    payct = body[32:32 + plen]
+    return head, _cbc(payct, key)
 
 
 def media_info(plain):
@@ -279,6 +311,25 @@ def main():
         with open(jpath, "w", encoding="utf-8") as fh:
             json.dump(objs, fh, ensure_ascii=False, indent=2)
         print(f"\nSteuerkanal: {len(objs)} JSON-Objekte -> {jpath}")
+
+    # Upstream (Telefon->Geraet): Steuerkommandos, u.a. Tueroeffnen
+    up_id = (dst_id, src_id)
+    upstream, _, _ = reassemble(packets, *up_id)
+    upframes = app_frames(upstream)
+    if upframes:
+        print(f"\nUpstream {up_id[0]:08x} -> {up_id[1]:08x}: "
+              f"{len(upframes)} Steuerframes")
+        for pos, f in upframes:
+            head, pay = decrypt_control(f[APP_HDR:], key)
+            if len(head) < 14:
+                continue
+            hexpay = re.search(rb'[0-9a-f]{64}', pay)   # SHA256 als Hex-ASCII
+            tag = ""
+            if hexpay:
+                door, lock = pay[0], pay[2]
+                tag = (f"  <== TUEROEFFNEN door={door} locknumber={lock} "
+                       f"pin_sha256={hexpay.group().decode()}")
+            print(f"  @{pos} typ={head[0]:#04x} plen={head[9]}{tag}")
 
     print(f"\nRendern:  ffmpeg -f h264 -r 17 -i {vpath} -c:v libx264 -pix_fmt yuv420p out.mp4")
 

@@ -111,23 +111,30 @@ Der reassemblierte Strom besteht lückenlos aus App-Frames (im Mitschnitt: 820 F
 +38  body                     <- ab hier: erste 64 B verschlüsselt, Rest Klartext
 ```
 
-### 5a. Krypto: nur die ersten 64 Byte — *bestätigt*
+### 5a. Krypto: byte9-gesteuerte Teilverschlüsselung — *bestätigt*
 
-**Das ist der Schlüssel zum Video.** Pro App-Frame sind **ausschließlich die ersten 64 Bytes (4 AES-Blöcke) des Bodys** mit **AES-256-CBC** verschlüsselt; alles danach ist **Klartext-H.264**.
+**Das ist der Schlüssel zu Video UND Türöffnen.** Pro App-Frame sind **zwei Bereiche** mit **AES-256-CBC** verschlüsselt, jeder als **eigenes Segment mit IV-Reset**; alles dazwischen/danach ist Klartext:
+
+1. **Kopf**: Body-Bytes `0..32` (2 Blöcke)
+2. **Nutzteil**: Body-Bytes `32 .. 32+plen`, wobei **`plen` = Byte 9 des entschlüsselten Kopfs**
 
 - **Key** = `<data-encode-key>` aus der Cloud-Geräteliste, als 32 ASCII-Bytes (nicht base64-dekodiert).
-- **IV** = `"0000000000000000"` (16× ASCII-Null `0x30`), konstant, **kein** IV-Reset innerhalb der 64 B.
+- **IV** = `"0000000000000000"` (16× ASCII-Null `0x30`) – **beide Segmente starten neu mit diesem IV**.
 
-Empirisch bestimmt: Der Grenzwert 64 wurde durch Durchprobieren aller Blockgrenzen und Messen der ffmpeg-Dekodierrate ermittelt.
+Bei **Medien-Frames** ist `plen = 32` → Kopf + Nutzteil = **64 B verschlüsselt**, danach roher H.264. Genau diese 64 B hatte die frühere Analyse als festen Wert gefunden – es ist aber nur der Spezialfall. Bei **Steuerframes** ist `plen` größer (beim Türöffnen 112).
+
+Empirisch bestätigt am Video (Durchprobieren aller Blockgrenzen, ffmpeg als Schiedsrichter):
 
 | verschlüsselte Länge | dekodierte Frames | Auflösung |
 |---|---|---|
 | 0 / 16 / 32 / 48 | 0 | — |
-| **64** | **505** | **352×280 Main** |
+| **64** (= plen 32) | **505** | **352×280 Main** |
 | 80 | 468 | 352×92 (defekt) |
 | 96 und mehr | ≤166 | defekt |
 
-Das erklärt zugleich den früheren Frida-Befund, `AES_cbc_encrypt` feuere nur mit kurzen Längen und beim Video-Bulk gar nicht: verschlüsselt wird eben nur der Kopf, und der Bulk-Pfad nutzt eine andere Codestelle. Die frühere Formulierung „Video ist unverschlüsselt, AES betrifft nur den Steuerkanal" war daher **im Ergebnis richtig, in der Begründung aber unvollständig** – auch Medien-Frames sind teilverschlüsselt, nur eben nicht in den Slice-Daten.
+Das erklärt zugleich den früheren Frida-Befund, `AES_cbc_encrypt` feuere nur mit kurzen Längen: verschlüsselt wird eben nur Kopf + kurzer Nutzteil, und der H.264-Bulk läuft im Klartext. Die frühere Formulierung „Video ist unverschlüsselt" war **im Ergebnis richtig, in der Begründung aber unvollständig** – auch Medien-Frames sind kopf-verschlüsselt, nur nicht in den Slice-Daten.
+
+`tools/p2p_decode.py` implementiert beide Wege: `decrypt_head()` (schnelle 64-B-Näherung für Video) und `decrypt_control()` (exakte byte9-Regel für Steuerframes).
 
 ### 5b. Entschlüsselter Frame-Kopf — *bestätigt*
 
@@ -161,11 +168,38 @@ Der Steuerkanal überträgt **JSON**, nicht nur den XML-CGI-Envelope. Aus dem Mi
 
 Das ist inhaltlich dieselbe Sub-Geräteliste, die die Cloud-API als `get-subdev-list` liefert – hier aber vom Gerät selbst durch den P2P-Tunnel. Der Gerätename „Türstation 1" im Klartext war der erste Beleg, dass Key und IV stimmen.
 
-## 6. Upstream (Telefon → Gerät)
+## 6. Upstream (Telefon → Gerät) & Türöffnen — *bestätigt*
 
-Der Upstream der Session ist winzig: **648 Byte in 5 App-Frames** (3× 136 B, 2× 120 B). Alle tragen denselben Aufbau wie oben; ihre Bodies sind auf den ersten 64 B verschlüsselt und enthalten Frame-Typ `0xFE` (Steuerung) bzw. `0x00`, den Zeitstempel und einen aufsteigenden Zähler in Feld `+18` (2,3,4,5,6).
+Der Upstream trägt die Steuerkommandos als App-Frames mit Frame-Typ `0xFE`. Ein separater Mitschnitt eines **echten Türöffnen-Vorgangs** (`downloads/p2p-open/open.pcap`, ausgelöst am Telefon, Ergebnis „Unlock successfully") hat den Öffnen-Befehl vollständig geliefert.
 
-Die konkrete Kommando-Semantik (welches Feld „Stream starten Kanal 1" bedeutet) ist **noch nicht entschlüsselt** – der Mitschnitt enthält nur eine Live-View-Session, **kein Türöffnen**. Für den Öffnen-Befehl fehlt schlicht ein Mitschnitt des entsprechenden Vorgangs.
+**Kopf jedes Steuerframes (entschlüsselt, 32 B):**
+
+```
++00  uint8   Frame-Typ    0xFE
++01  uint32  Zeitstempel  Unix-Sekunden
++09  uint8   plen         Länge des verschlüsselten Nutzteils ab Body-Offset 32
++0b  uint8   clen         Länge des Kommando-Payloads (ohne Trailer)
++0d  uint8   msg-id/seq
+```
+
+**Türöffnen-Kommando** (Nutzteil, `plen` = 112 B, eigenes CBC-Segment):
+
+```
++00  uint8   door         Kanal / Türstation (hier 1)
++01  uint8   ?            0
++02  uint8   locknumber   Schlossnummer (hier 1)
++03  uint8   ?            1  (vermutlich Aktion: 1 = entriegeln)
++04  12 B    0
++10  64 B    SHA256(Tür-PIN) als Hex-ASCII      <- clen deckt +00..+50 ab (16+64)
++50  32 B    Trailer      Signatur/MAC, Ableitung noch offen
+```
+
+Verifiziert: Der Hash im abgefangenen Frame ist exakt `SHA256(<Tür-PIN>)` – identisch mit dem Hash im Cloud-Pfad (`PROTOCOL.md`/Notes) und mit dem `out-auth-code` der Geräteliste. `door`/`locknumber` entsprechen den Feldern des Cloud-CGI `set.device.opendoor`. Das Kommando läuft also **nicht** über die Cloud, sondern durch den P2P-Tunnel – wie in 5h vorhergesagt.
+
+`tools/p2p_decode.py` erkennt das automatisch und gibt aus (Hash hier gekürzt):
+`@900 typ=0xfe plen=112  <== TUEROEFFNEN door=1 locknumber=1 pin_sha256=<64 hex>`
+
+**Offen:** Der 32-B-Trailer (Feld `+50`) ist kein naheliegender Hash (getestet: SHA256 über param/hash/key/Kombinationen – kein Treffer). Vermutlich HMAC oder Signatur mit einem Session-Geheimnis (dynamic-password?). Für einen eigenständigen Öffner muss dessen Ableitung noch geklärt werden – das ist der letzte fehlende Baustein.
 
 ## 7. Bestätigt vs. offen
 
@@ -174,21 +208,23 @@ Die konkrete Kommando-Semantik (welches Feld „Stream starten Kanal 1" bedeutet
 - Hole-Punch über Rendezvous + WAN- und LAN-Adresse des Geräts, INIT-Struktur mit Token und Antwort-Flag.
 - Verbindungs-IDs sind hochlaufende Zählerpaare; beide Richtungen mit ISN ≠ 0.
 - App-Frame-Format (56-B-Kopf) und lückenlose Reassembly (100 % des Mitschnitts).
-- **Krypto vollständig: AES-256-CBC über exakt die ersten 64 Body-Bytes, Key = `data-encode-key`, IV = `"0"×16`.**
+- **Krypto vollständig: byte9-gesteuerte AES-256-CBC (Kopf 32 B + Nutzteil `plen` B, je IV = `"0"×16`), Key = `data-encode-key`.** Bei Medien = 64 B, bei Steuerframes länger.
 - **Video vollständig rekonstruiert:** 505 Frames, 352×280, H.264 Main, gerendert und visuell verifiziert (Fisheye-Bild der Türstation).
 - Steuerkanal-Payload ist JSON (Sub-Geräteliste im Klartext gelesen).
+- **Türöffnen-Kommando entschlüsselt:** Upstream-Steuerframe Typ `0xFE`, Nutzteil `door`/`locknumber` + `SHA256(<Tür-PIN>)` (Hex-ASCII); Hash gegen die bekannte PIN verifiziert.
 
 **Offen / nächste Schritte für eine eigenständige Implementierung:**
-1. **Türöffnen-Kommando:** Mitschnitt eines echten Öffnen-Vorgangs anfertigen (`tcpdump` + Tap auf das Schloss-Icon), dann den Upstream-Body mit `tools/p2p_decode.py` entschlüsseln. Das ist der **einzige noch fehlende Baustein** für den Standalone-Türöffner.
-2. **Stream-Start-Kommando:** analog aus dem Upstream der Live-View-Session ableiten (Felder der 5 Frames semantisch zuordnen).
+1. **Öffnen-Trailer (32 B):** die Signatur/MAC am Ende des Kommandos ableiten – ohne sie akzeptiert das Gerät ein selbstgebautes Kommando vermutlich nicht. Kandidaten: HMAC mit `dynamic-password` oder dem INIT-Token. **Wichtigster verbleibender Baustein für den Standalone-Türöffner.**
+2. **Stream-Start-Kommando:** die zwei Vorbereitungs-Frames (`plen=48`, Typ `0xFE`) vor dem Öffnen semantisch zuordnen; analog für „Live Kanal 1 starten".
 3. **Adress-Discovery:** Woher bekommt der Client die WAN/LAN-Kandidaten und die Rendezvous-Adresse? Vermutlich ein Cloud-Call vor dem Punch – noch mitzuschneiden (TLS, daher Frida `SSL_write` beim Verbindungsaufbau).
-4. **Prüfsumme (Feld 6, untere 16 Bit):** Algorithmus unbekannt. Für einen eigenen Client nötig, sofern das Gerät sie prüft.
+4. **Prüfsumme (Transport-Feld 6, untere 16 Bit):** Algorithmus unbekannt. Für einen eigenen Client nötig, sofern das Gerät sie prüft.
 5. **Sende-Seite:** ARQ/Retransmit-Timing und Fensterlogik nachbauen.
 
 ## 8. Artefakte
 
-- `tools/p2p_decode.py` — konsolidierter Dekoder (pcap → H.264 + JSON), verifiziert
-- `downloads/p2p-capture/session.pcap` — vollständiger Session-Mitschnitt
-- `downloads/p2p-capture/decoded/stream.h264`, `session.mp4`, `frame120.jpg` — dekodiertes Ergebnis
+- `tools/p2p_decode.py` — konsolidierter Dekoder (pcap → H.264 + JSON + Türöffnen-Erkennung), verifiziert
+- `downloads/p2p-capture/session.pcap` — vollständiger Live-View-Mitschnitt
+- `downloads/p2p-capture/decoded/stream.h264`, `session.mp4`, `frame120.jpg` — dekodiertes Video
 - `downloads/p2p-capture/decoded/control.json` — entschlüsselter Steuerkanal
+- `downloads/p2p-open/open.pcap` — Mitschnitt eines echten Türöffnen-Vorgangs
 - `scratchpad/frida_aeskey.py`, `frida_mode.py` — AES-Key/IV/Modus (Herkunft des Keys)
