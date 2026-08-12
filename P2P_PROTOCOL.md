@@ -253,9 +253,19 @@ Der **Türöffner** braucht nur 1–3 (kein Video). Die Krypto- und Kommando-Sch
 
 Der Verbindungsaufbau wurde per Frida-Hook auf `libqv-p2p-v2.so!SSL_write/SSL_read` (die App-eigene MQTT-Implementierung `tdkcloud::MqttSession`) beim App-Start vollständig erfasst. Wichtig: **Frida `spawn`** nötig – die Signalisierung läuft direkt nach dem Start, ein späteres `attach` verpasst sie.
 
-**1. MQTT-Verbindung** zum Broker `mqttsr1.qvcloud.net` (TLS):
+**0. Bootstrap: Server-Discovery** über `GET https://global.qvcloud.net/mst/query` (Kommando `query-hlrv2`, `server-type=userapp,alarmapp,p2papp,natcheck,appinfo,oauth2,log,openapi`). Die XML-Antwort liefert pro Dienst URL + Parameter, u. a.:
+- `p2papp`: `url = mqtts://mqttsr1.qvcloud.net:1884`, `uri = /app/ust/json`, und ein `param`-Feld mit `username=<b64>&password=<b64>&JwtExp=…` (die MQTT-Credentials, **verschlüsselt**, s. u.).
+- `natcheck`: `url = udp://8.211.5.8:8300` (STUN-artiger Init-Server für die eigene `pub-ip`).
+- weitere: `oauth2r1.qvcloud.net`, `tdkopenapir1.qvcloud.net`, `r1-x.qvcloud.net` (tdkcloud). Werte werden in `shared_prefs/save.xml` gecacht (`ip-validity` ~7 Tage).
+
+**MQTT-Credential-Dekodierung** (des `param`-Felds): Jeder Wert ist `base64` → **AES-256-CBC** entschlüsselt, **IV = `"0000000000000000"`** (16× ASCII-`0x30`, wie beim Frame-Krypto), Ergebnis null-gepadded:
+- `username` → `B_<cli-id>`
+- `password` → der RS256-JWT
+Der **AES-256-Schlüssel** ist **nicht** in der Lib hinterlegt (zur Laufzeit erzeugt) und wurde per Frida-Hook auf `AES_set_decrypt_key`/`AES_cbc_encrypt(enc=0)` erfasst. **Er war über alle App-Neustarts stabil** (account-gebunden), seine Ableitung ist aber noch offen – bis dahin muss er einmalig per Frida abgegriffen werden (Geheimnis, nicht im Repo).
+
+**1. MQTT-Verbindung** zum Broker `mqttsr1.qvcloud.net:1884` (TLS):
 - Protokoll `MQIsdp` (MQTT 3.1), Client-ID `app_<cli-id>_<user-id>_`
-- Username `B_<cli-id>`, **Password = RS256-JWT** (Payload: `cli-id`, `cli-type:app`, `exp`, `oem-group:G0028,G0126`, `qv-rgn:1`) – vom Server signiert, aus einem Cloud-Call geholt (Herkunft noch zu bestätigen, vermutlich `/qvoauthv2/token`).
+- Username `B_<cli-id>`, **Password = RS256-JWT** (Payload: `cli-id`, `cli-type:app`, `exp`, `oem-group:G0028,G0126`, `qv-rgn:1`) – beide aus dem `param`-Feld dekodiert (s. o.).
 - Publish-Topic `app/ust/json/<cli-id>`, Subscribe-Topic `<cli-id>/ust/json`. Nutzlast ist JSON mit `header.command` + `content`.
 
 **2. Signalisierungs-Kommandos** (JSON über MQTT):
@@ -276,7 +286,11 @@ Der Client punched dann UDP-INIT (§4c) mit der `session-flag` parallel an `loc`
 **Damit ist der komplette Weg zum eigenständigen Türöffner kartiert:**
 Cloud-Login → `get-device-list` (duid, `data-encode-key`, `dynamic-password`, PIN-Hash) → JWT holen → MQTT-`p2pconnect` (Adressen + `session-flag`) → UDP-Hole-Punch → KCP-Session → Öffnen-Frame (AES + SHA256-Trailer) senden.
 
-**Verbleibende Implementierungs-Unbekannte** (Stand nach der Wire-Analyse): nur noch **(a) welcher Cloud-Call den JWT liefert** und **(b) der genaue STUN-Austausch mit dem Init-Server** (`8.211.5.8`, Typ `0x54`/`0x44`) zur eigenen `pub-ip`. Das INIT-Format (§4c), die Header-Semantik (§4a – inkl. „keine Prüfsumme") und der Öffnen-Frame sind vollständig geklärt. Für den Öffner genügt notfalls die eigene LAN-Adresse in `update-netinfo` (der Rendezvous `utd-pub-ip` ermittelt die WAN-Adresse aus dem eintreffenden UDP-Paket selbst).
+**Verbleibende Implementierungs-Unbekannte** (Stand nach Discovery- + Wire-Analyse):
+- **(a) Ableitung des MQTT-Credential-AES-Keys** (§0) – account-stabil, aber laufzeit-erzeugt; bis geklärt einmalig per Frida abzugreifen. **Einziger nicht vollständig eigenständiger Baustein.**
+- **(b) STUN-Austausch mit dem `natcheck`-Server** (`udp://8.211.5.8:8300`, Typ `0x54`/`0x44`) zur eigenen `pub-ip` – für den Öffner umgehbar (der Rendezvous `utd-pub-ip` ermittelt die WAN-Adresse aus dem eintreffenden UDP-Paket selbst; `update-netinfo` mit der LAN-Adresse genügt notfalls).
+
+Alles andere ist vollständig geklärt: Bootstrap (`mst/query`), MQTT-Flow (`register`/`p2pconnect`), Credential-Dekodierung (AES-256-CBC, IV=`"0"×16`), INIT-Format (§4c), Header-Semantik (§4a, „keine Prüfsumme") und der Öffnen-Frame (§6a, bit-genau).
 
 ## 8. Artefakte
 
