@@ -292,6 +292,20 @@ Cloud-Login → `get-device-list` (duid, `data-encode-key`, `dynamic-password`, 
 
 Alles andere ist vollständig geklärt: Bootstrap (`mst/query`), MQTT-Flow (`register`/`p2pconnect`), Credential-Dekodierung (AES-256-CBC, IV=`"0"×16`), INIT-Format (§4c), Header-Semantik (§4a, „keine Prüfsumme") und der Öffnen-Frame (§6a, bit-genau).
 
+## 7b. Eigenständige Sende-Seite — *live verifiziert (Python-Client)*
+
+Ein reiner Python-Client (ohne App/Frida, nur `paho-mqtt` + `cryptography`) wurde gebaut und gegen die **echte Cloud + das echte Gerät** getestet. **Live bestätigt:**
+
+1. **Bootstrap** `GET global.qvcloud.net/mst/query` (GET mit XML-Body, **keine Auth**) → alle Server-URLs + verschlüsseltes MQTT-`param`. ✅
+2. **MQTT-Credential-Dekodierung** (AES-256-CBC, IV=`"0"×16`, account-stabiler Key) → `B_<cli-id>` + JWT. ✅ (liefert live gültige Credentials)
+3. **MQTT-CONNECT** (mqttsr1:1884, MQIsdp) + `register` + **`p2pconnect`** → das Gerät antwortet mit seinen aktuellen `loc`/`pub`/`utd`-Adressen + `session-flag`. ✅
+4. **natcheck-STUN** (`8.211.5.8:8300`, Typ `0x54`): Request mit Nonce @0x44, Antwort trägt die **eigene öffentliche IP als ASCII-String @0x4c** + Port @0x5c. ✅ (getestet: NAT ist port-preserving)
+5. **Hole-Punch**: 164-B-INIT (Typ `0x88`, `session-flag` + Ziel-IP-String + Port + Kandidaten-Index @0x38) parallel an `loc`/`pub`/`utd`. Der **Rendezvous echot das INIT** (Antwort-Flag @0x2e=1, eigene Nonce zurückgespiegelt) und relayt den **App-CONNECT-Handshake**. ✅
+
+**Session-Handshake** (aus `open.pcap`, verstanden): nach dem CONNECT sendet der Client einen 28-B-**SYN** (`src=0, dst=<client-id>`), das Gerät antwortet mit `src=<client-id>, dst=<device-id>, ack=1` (verrät seine ID), dann bestätigt der Client. Danach Datenpakete `src=<device-id>, dst=<client-id>`.
+
+**Offener Blocker:** Der **direkte NAT-Punch zum Gerät** gelang im Test nicht — nur der Rendezvous antwortet, das Gerät (WAN) punched trotz korrektem `update-netinfo` nicht direkt zurück. Damit fehlt der Datenpfad für den 28-B-SYN/die KCP-Datenphase. Ursache vermutlich NAT-Timing/-Symmetrie auf der Geräteseite; die App löst das (evtl. über Relay-Datenpfad oder präziseres Punch-Timing), der genaue Mechanismus des `utd`-Relays für **Nutzdaten** (nicht nur Signalisierung) ist noch offen. Der Öffnen-Frame selbst ist fertig (§6a, bit-genau); es fehlt nur der Transport zum Gerät.
+
 ## 8. Artefakte
 
 - `tools/p2p_decode.py` — konsolidierter Dekoder (pcap → H.264 + JSON + Türöffnen-Erkennung), verifiziert
