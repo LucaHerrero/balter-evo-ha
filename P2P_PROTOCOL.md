@@ -311,9 +311,29 @@ Ein reiner Python-Client (ohne App/Frida, nur `paho-mqtt` + `cryptography`) wurd
 8. **Header-Prüfsumme = Internet-Checksum** (RFC 1071, aus `TDK_F_SYS_CheckSum` disassembliert): Ones-complement-Summe der 16-Bit-Wörter über den 28-B-Header, gefaltet, invertiert → Feld 6 `[csum | len]`. Erklärt rückwirkend „f6_lo+seq=konstant" (die Prüfsumme kompensiert seq). Kontrollpakete tragen `win_hi=0xffff`. ✅
 9. **KCP-Session-Handshake:** 28-B-SYN (`s=0,d=<client-id>`) → SYN-ACK (`s=<client-id>,d=<device-id>,ack=1`) → ACK. **Live etabliert** – das Gerät akzeptiert den SYN und **ackt anschließend meine Datenpakete** (BW-Test + Öffnen-Frame, `ack` läuft korrekt mit). ✅
 
-**Verbleibender Blocker – App-Session-Layer:** Das Gerät **ackt** den Öffnen-Frame auf KCP-Ebene, **verarbeitet** ihn aber nicht auf App-Ebene und sendet nach der SYN-ACK **keine eigenen Daten** (kein Downstream-Handshake/Video). Der Vergleich mit dem erfolgreichen Mitschnitt zeigt die App-Session-Struktur im Byte-Stream: BW-Test → Setup-Frames (`typ=0xFE clen=1`, `typ=0x00 clen=0`) → `opendoor` → `typ=0x07`-Close, mit fortlaufender App-`msg-id` (3,4,5,6,7). Entscheidend: Der **App-Frame-Kopf trägt bei `@0x2a` eine 3-Byte-Session-ID**, die über alle Frames einer Session konstant ist (`0x09c63b` bzw. `0x48442e` in zwei Sessions) und **client-generiert** ist – sie leitet sich nicht per Hash/CRC aus der `session-flag` ab. Ohne die korrekte Session-ID (und den vollständigen Session-Open-Ablauf) ignoriert der App-Parser des Geräts den `opendoor`.
+## 7c. App-Session-Schicht: LOGIN-Frame + Sequenz-Nachbau — *offline verifiziert, Live-Test läuft*
 
-**Nächster Schritt:** Frida-Hook auf die App-Frame-Erzeugung (`tdkcloud::KcpLinkConn`/`IQVCGIConfig`), um die Herkunft der `@0x2a`-Session-ID und den genauen Session-Open-Ablauf zu klären. Die gesamte Transport-Schicht (Discovery → Relay-Punch → KCP-Session) ist **live verifiziert**; es fehlt nur noch dieser App-Session-Layer.
+Ein Frida-Capture (`AES_cbc_encrypt(enc=1)` onEnter = Klartext vor Verschlüsselung) eines echten App-Öffnens lieferte die **komplette App-Session-Sequenz im Klartext**. Der fehlende Baustein aus 7b war der **LOGIN-Frame (typ=0x01)**, der die Steuersession authentifiziert – ohne ihn verwirft das Gerät alle Folge-Kommandos trotz gültiger KCP-Session.
+
+**Steuerkanal-Sequenz** (fortlaufender KCP-Byte-Stream, `outer_msg` 1..6):
+
+| msg | typ | bmsg | Inhalt |
+|-----|-----|------|--------|
+| 1 | 0x01 | 1 | **LOGIN**: `adminapp&&<dynamic_password>\0<OEM>\0clientid=<id>\0` (Krypto-Kopf `[15]=[16]=1`) |
+| 2 | 0xFE | 5 | Setup, clen=1, payload `0x00` |
+| 3 | 0xFE | 6 | Setup, clen=1, payload `0x00` |
+| 4 | 0xFE | 2 | Setup, clen=1, payload `0x00` |
+| 5 | 0xFE | 4 | **opendoor**, clen=80 (door/lock + PIN-Hash) |
+| 6 | 0x07 | 0 | close |
+
+- `dynamic_password` = rotierendes Geräte-Passwort aus der Cloud-Geräteliste (`get-device-list`).
+- **Äußerer 56-B-App-Frame-Kopf voll deterministisch:** `@0x00 ffffffff`, `@0x04 total=56+bodylen`, `@0x10 0001000003011200` (konst.), `@0x18 outer_msg` (seq.), `@0x24 bodylen+16`, `@0x2a sess` (3 B), `@0x2d 000004` (konst.), `@0x30 bodylen`.
+
+Neue Builder in `tools/p2p_decode.py`: `build_login_payload()`, `build_app_frame()`, `build_control_frame(..., flag15, flag16)`. **Offline bit-genau verifiziert:** reproduzieren die `open.pcap`-Frames (Setups + opendoor) bit-identisch; der LOGIN-Body (Kopf + Payload + SHA256-Trailer) matcht den Frida-Klartext exakt.
+
+**Live-Test (scharf, gegen echtes Gerät):** KCP-Session steht, der komplette selbstgebaute Stream (LOGIN + Setups + opendoor + close) wird gesendet und das **Geräte-ACK bestätigt vollständige Zustellung** – aber opendoor wird noch nicht verarbeitet.
+
+**Verbleibender Blocker – die `sess`-ID @0x2a:** Sie ist **pro Session unterschiedlich** (zwei Mitschnitte: `442e48` vs. `3bc609`), der Client nutzt aktuell einen hartcodierten Alt-Wert. Zudem fehlen `outer_msg=1,2` in beiden pcap-Mitschnitten (Captures starten bei msg=3) – der LOGIN läuft vermutlich über einen anderen Kanal. **Nächster Schritt:** `sendto()`/`recvfrom()`-Hook (libc) für die vollständige Wire-Struktur EINER lebenden Session → klärt Herkunft der `sess`-ID (client-random vs. device-vergeben) und die Kanal-/msg-Zuordnung. Transport-Schicht (Discovery → Relay-Punch → KCP-Session) und Krypto/App-Frame-Bau sind verifiziert; es fehlt nur die korrekte Session-ID-Wahl.
 
 ## 8. Artefakte
 

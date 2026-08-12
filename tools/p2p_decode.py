@@ -204,7 +204,7 @@ def verify_trailer(head, nutzteil):
     return frame_trailer(head, payload) == trailer, payload, trailer
 
 
-def build_control_frame(ftype, timestamp, msg_id, payload, key):
+def build_control_frame(ftype, timestamp, msg_id, payload, key, flag15=0, flag16=0):
     """Baut einen kompletten (verschluesselten) Steuerframe-Body.
 
     Gegenstueck zu decrypt_control(): Kopf-Segment (32 B) + Nutzteil-Segment
@@ -212,20 +212,65 @@ def build_control_frame(ftype, timestamp, msg_id, payload, key):
     Verifiziert: reproduziert den aufgezeichneten Tueroeffnen-Frame bit-genau.
 
     payload = Kommando-Bytes OHNE Trailer.
+    plen (Kopf[9]) = auf 16 aufgerundete Nutzteillaenge (payload + 32-B-Trailer).
+    flag15/flag16 (Kopf[15]/[16]) = beide 1 nur beim LOGIN (typ=0x01), sonst 0.
     """
     clen = len(payload)
-    plen = clen + 32
+    nutzlen = clen + 32
+    plen = nutzlen + ((16 - nutzlen % 16) % 16)   # auf 16 aufgerundet
     head = bytearray(32)
-    head[0] = ftype                              # 0xFE = Steuerung
+    head[0] = ftype                              # 0xFE = Steuerung, 0x01 = Login
     struct.pack_into("<I", head, 1, timestamp)   # Unix-Sekunden
     head[9] = plen                               # verschluesselte Nutzteillaenge
     head[11] = clen                              # Payload ohne Trailer
-    head[13] = msg_id
+    head[13] = msg_id                            # Kommando-Nummer
+    head[15] = flag15
+    head[16] = flag16
     trailer = frame_trailer(head, payload)
     nutzteil = bytes(payload) + trailer
     if len(nutzteil) % 16:
         nutzteil += b"\x00" * (16 - len(nutzteil) % 16)
     return _cbc_enc(bytes(head), key) + _cbc_enc(nutzteil, key)
+
+
+def build_login_payload(dynamic_password, clientid, oem="G0028G0126"):
+    """Nutzteil des App-Session-LOGIN (typ=0x01), der die Steuersession
+    authentifiziert. Ohne diesen Frame verwirft das Geraet spaetere Kommandos
+    (z.B. Tueroeffnen) trotz gueltiger Transport-/KCP-Session.
+
+    Aufbau: 'adminapp&&' + dynamic_password + \\0 + oem + \\0 + 'clientid=' + id + \\0
+    dynamic_password stammt aus der Cloud-Geraeteliste (rotiert ~woechentlich).
+    """
+    if isinstance(dynamic_password, bytes):
+        dynamic_password = dynamic_password.decode("ascii")
+    return (b"adminapp&&" + dynamic_password.encode("ascii") + b"\x00"
+            + oem.encode("ascii") + b"\x00"
+            + b"clientid=" + clientid.encode("ascii") + b"\x00")
+
+
+APP_FRAME_CONST_10 = bytes.fromhex("0001000003011200")   # @0x10..0x18, konstant
+
+
+def build_app_frame(outer_msg, body, sess):
+    """Umhuellt einen (verschluesselten) Steuerframe-Body mit dem aeusseren
+    56-B-App-Frame-Kopf. Alle Laengenfelder sind aus body-len ableitbar; nur
+    outer_msg (sequenziell ab 1) und sess (3-B client-gewaehlte Verbindungs-ID,
+    vom Geraet zurueckgespiegelt) sind frei.
+    """
+    if isinstance(sess, str):
+        sess = bytes.fromhex(sess)
+    assert len(sess) == 3
+    body_len = len(body)
+    hdr = bytearray(56)
+    hdr[0:4] = b"\xff\xff\xff\xff"
+    struct.pack_into("<I", hdr, 0x04, 56 + body_len)      # total-len
+    hdr[0x10:0x18] = APP_FRAME_CONST_10
+    struct.pack_into("<I", hdr, 0x18, outer_msg)          # sequenzielle msg-id
+    struct.pack_into("<I", hdr, 0x24, body_len + 16)      # body+16
+    hdr[0x2a:0x2d] = sess                                 # Verbindungs-ID
+    hdr[0x2d:0x30] = bytes.fromhex("000004")
+    struct.pack_into("<I", hdr, 0x30, body_len)           # body-len
+    return bytes(hdr) + body
 
 
 def build_open_payload(door, locknumber, pin_sha256_hex):
