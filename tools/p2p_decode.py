@@ -254,8 +254,19 @@ APP_FRAME_CONST_10 = bytes.fromhex("0001000003011200")   # @0x10..0x18, konstant
 def build_app_frame(outer_msg, body, sess):
     """Umhuellt einen (verschluesselten) Steuerframe-Body mit dem aeusseren
     56-B-App-Frame-Kopf. Alle Laengenfelder sind aus body-len ableitbar; nur
-    outer_msg (sequenziell ab 1) und sess (3-B client-gewaehlte Verbindungs-ID,
-    vom Geraet zurueckgespiegelt) sind frei.
+    outer_msg und sess sind frei.
+
+    outer_msg ist ein PRO-KANAL-UND-RICHTUNG fortlaufender App-Frame-Zaehler ab 1
+    (msg1 = LOGIN, msg2 = erstes Setup, ...). In open.pcap/punch.pcap beginnt der
+    sichtbare Upstream bei msg=3, weil der tcpdump erst NACH dem Login-Handshake
+    (msg1/2 je Richtung) startete -- nicht weil LOGIN ueber einen anderen Kanal
+    laeuft.
+
+    sess (3 B @0x2a) ist eine CLIENT-gewaehlte Verbindungs-ID: der Client sendet
+    seine App-Frames nachweislich VOR dem Geraet (open.pcap +59 ms, punch.pcap
+    +104 ms), waehlt sess also selbst. Das Geraet spiegelt sie NICHT zurueck --
+    seine Downstream-Frames tragen an @0x2a konstant `00 04 00`. Ob das Geraet
+    sess ueberhaupt prueft (und ob ein frischer Zufallswert noetig ist) ist offen.
     """
     if isinstance(sess, str):
         sess = bytes.fromhex(sess)
