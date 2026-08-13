@@ -132,6 +132,50 @@ def app_frames(buf):
     return out
 
 
+def iter_control_frames(packets, key):
+    """Steuerframes robust je EINZELPAKET extrahieren (statt per Stream-Reassembly).
+
+    Steuerframes (LOGIN, Setup, Tueroeffnen, close) passen in ein UDP-Paket. Der
+    Bandbreitentest (0xBB-Filler) belegt auf demselben Kanal ueberlappende seq-
+    Bereiche, an denen reassemble() den echten App-Frame faelschlich als Retransmit
+    verwirft (so verschwand frueher der LOGIN bei om=1/seq=165). Dieser Scan sucht
+    daher in jedem Paket direkt nach eingebetteten `ffffffff`-App-Frames.
+
+    Liefert je Fund ein dict: channel (src_id,dst_id), seq, outer_msg, sess (hex),
+    typ, bmsg, clen, plen, trailer_ok, payload. Dedupliziert nach (channel,outer_msg)
+    -- der Trailer-korrekte Treffer gewinnt gegenueber Bandbreitentest-Rauschen.
+    """
+    best = {}
+    for _t, _s, _sp, _d, _dp, pl in packets:
+        if pl[:4] != MAGIC or len(pl) < TRANSPORT_HDR:
+            continue
+        f = parse_header(pl)
+        if f[1] == 0:
+            continue
+        i = pl.find(b"\xff\xff\xff\xff", TRANSPORT_HDR)
+        while i >= 0 and i + APP_HDR <= len(pl):
+            total = struct.unpack("<I", pl[i + 4:i + 8])[0]
+            if APP_HDR <= total <= 2000 and i + total <= len(pl):
+                fr = pl[i:i + total]
+                head, pay = decrypt_control(fr[APP_HDR:], key)
+                if len(head) >= 14:
+                    ok, payload, _tr = verify_trailer(head, pay)
+                    rec = {
+                        "channel": (f[1], f[2]),
+                        "seq": f[3] + (i - TRANSPORT_HDR),
+                        "outer_msg": struct.unpack("<I", fr[0x18:0x1c])[0],
+                        "sess": fr[0x2a:0x2d].hex(),
+                        "typ": head[0], "bmsg": head[13],
+                        "clen": head[11], "plen": head[9],
+                        "trailer_ok": ok, "payload": payload,
+                    }
+                    k = (rec["channel"], rec["outer_msg"])
+                    if k not in best or (ok and not best[k]["trailer_ok"]):
+                        best[k] = rec
+            i = pl.find(b"\xff\xff\xff\xff", i + 4)
+    return sorted(best.values(), key=lambda r: (r["channel"], r["outer_msg"]))
+
+
 def _cbc(buf, key):
     n = (len(buf) // 16) * 16
     if n < 16:
