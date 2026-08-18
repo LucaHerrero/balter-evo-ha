@@ -333,7 +333,32 @@ Neue Builder in `tools/p2p_decode.py`: `build_login_payload()`, `build_app_frame
 
 **Live-Test (scharf, gegen echtes Gerät):** KCP-Session steht, der komplette selbstgebaute Stream (LOGIN + Setups + opendoor + close) wird gesendet und das **Geräte-ACK bestätigt vollständige Zustellung** – aber opendoor wird noch nicht verarbeitet.
 
-**Verbleibender Blocker – die `sess`-ID @0x2a:** Sie ist **pro Session unterschiedlich** (zwei Mitschnitte: `442e48` vs. `3bc609`), der Client nutzt aktuell einen hartcodierten Alt-Wert. Zudem fehlen `outer_msg=1,2` in beiden pcap-Mitschnitten (Captures starten bei msg=3) – der LOGIN läuft vermutlich über einen anderen Kanal. **Nächster Schritt:** `sendto()`/`recvfrom()`-Hook (libc) für die vollständige Wire-Struktur EINER lebenden Session → klärt Herkunft der `sess`-ID (client-random vs. device-vergeben) und die Kanal-/msg-Zuordnung. Transport-Schicht (Discovery → Relay-Punch → KCP-Session) und Krypto/App-Frame-Bau sind verifiziert; es fehlt nur die korrekte Session-ID-Wahl.
+### 7d. `sess`-ID @0x2a — geklärt: geteilte Basis + Kanalzähler (2026-08-18)
+
+Die `sess`-ID @0x2a war der Blocker. Durch **Disassembly von `libqv-p2p-v2.so`** (ARM64,
+17.269 `.dynsym`-Symbole, Namespace `tdkcloud::*`) + Byte-Diff der zwei funktionierenden
+Mitschnitte (`cold2.pcap`, `open.pcap`) ist die Struktur geklärt: die 3-Byte-`sess` ist
+**nicht frei-zufällig pro Kanal**, sondern
+
+```
+sess = [2-B-Session-Basis, von den Medienkanälen ch0/ch1 GETEILT][1-B-Kanalzähler, +1]
+  cold2:  ch0 = 3a09 07   ch1 = 3a09 08     (Basis 3a09 geteilt)
+  open :  ch0 = 442e 48   ch1 = 442e 49     (Basis 442e geteilt)
+```
+
+Frühere Clients würfelten beide Kanäle unabhängig → die geteilte Basis fehlte. Das Gerät
+**ackt** solche Frames transportseitig (kumulatives ARQ), verarbeitet sie im **App-Layer
+aber nicht** → sein 2. Downstream-Frame (144 B) und damit LOGIN/Video/opendoor bleiben aus.
+Bestätigt aus der Lib: `P2PConnect`/`P2PManager` vergeben pro Verbindung fortlaufende
+Slot-IDs; die Kette `OnRespP2PConnect → P2PTest (MTU-/BW-Test) → mtuTestOk → OnMtuTestOk`
+zeigt die Verwaltung. Die Basis ist client-gewählt (Client sendet vor dem Gerät; der
+Geräte-Downstream trägt @0x2a konstant `00 04 00`) — nur die **Kopplung** muss stimmen.
+
+**Fix** (`make_sess_pair()`): gemeinsame 2-B-Basis, `ch0=base+ctr`, `ch1=base+(ctr+1)`.
+Offline bit-genau verifiziert (a9-Frame byte-identisch zu cold2, außer uninit. Heap-Garbage
+@0x08). Scharfer Test gegen das Gerät steht aus. Transport (Discovery → Relay-Punch →
+KCP-Session), Krypto und App-Frame-Bau sind verifiziert; die sess-Kopplung war die letzte
+byte-belegte Abweichung zur echten App.
 
 ## 8. Artefakte
 
