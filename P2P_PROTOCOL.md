@@ -333,32 +333,28 @@ Neue Builder in `tools/p2p_decode.py`: `build_login_payload()`, `build_app_frame
 
 **Live-Test (scharf, gegen echtes Gerät):** KCP-Session steht, der komplette selbstgebaute Stream (LOGIN + Setups + opendoor + close) wird gesendet und das **Geräte-ACK bestätigt vollständige Zustellung** – aber opendoor wird noch nicht verarbeitet.
 
-### 7d. `sess`-ID @0x2a — geklärt: geteilte Basis + Kanalzähler (2026-08-18)
+### 7d. Zwei Client-Abweichungen gefunden — aber NICHT der 144B-Blocker (2026-08-18)
 
-Die `sess`-ID @0x2a war der Blocker. Durch **Disassembly von `libqv-p2p-v2.so`** (ARM64,
-17.269 `.dynsym`-Symbole, Namespace `tdkcloud::*`) + Byte-Diff der zwei funktionierenden
-Mitschnitte (`cold2.pcap`, `open.pcap`) ist die Struktur geklärt: die 3-Byte-`sess` ist
-**nicht frei-zufällig pro Kanal**, sondern
+Durch **Disassembly von `libqv-p2p-v2.so`** (ARM64, 17.269 `.dynsym`-Symbole, Namespace
+`tdkcloud::*`) + Byte-Diff der zwei funktionierenden Mitschnitte (`cold2.pcap`, `open.pcap`)
+wurden zwei bislang falsch nachgebaute Felder identifiziert und gefixt. **Beide scharf
+getestet — keiner löst den Blocker** (Gerät bleibt bei Stufe 1, sendet sein 144B nicht):
 
-```
-sess = [2-B-Session-Basis, von den Medienkanälen ch0/ch1 GETEILT][1-B-Kanalzähler, +1]
-  cold2:  ch0 = 3a09 07   ch1 = 3a09 08     (Basis 3a09 geteilt)
-  open :  ch0 = 442e 48   ch1 = 442e 49     (Basis 442e geteilt)
-```
+1. **`sess`-ID @0x2a** ist strukturiert, nicht frei-zufällig pro Kanal:
+   `[2-B-Session-Basis, von ch0/ch1 GETEILT][1-B-Kanalzähler, +1]`
+   (cold2: `3a09 07`/`3a09 08`; open: `442e 48`/`442e 49`). Frühere Clients würfelten
+   beide Kanäle unabhängig. Fix `make_sess_pair()`, offline byte-verifiziert — **Test: kein 144B.**
+2. **In-stream MTU-Test-0x88** (`SendMtuTestMsg`/`OnRequMtuMsg`): nach dem Geräte-76B
+   sendet der echte Client ein 0x88 mit rf=0, **nonce=0**, testid @0x38, Testwert @0xa0
+   (kein Punch-Format), das Gerät spiegelt mit rf=1. Fix `build_mtu_probe()`,
+   offline byte-verifiziert — **Test: kein 144B.**
 
-Frühere Clients würfelten beide Kanäle unabhängig → die geteilte Basis fehlte. Das Gerät
-**ackt** solche Frames transportseitig (kumulatives ARQ), verarbeitet sie im **App-Layer
-aber nicht** → sein 2. Downstream-Frame (144 B) und damit LOGIN/Video/opendoor bleiben aus.
-Bestätigt aus der Lib: `P2PConnect`/`P2PManager` vergeben pro Verbindung fortlaufende
-Slot-IDs; die Kette `OnRespP2PConnect → P2PTest (MTU-/BW-Test) → mtuTestOk → OnMtuTestOk`
-zeigt die Verwaltung. Die Basis ist client-gewählt (Client sendet vor dem Gerät; der
-Geräte-Downstream trägt @0x2a konstant `00 04 00`) — nur die **Kopplung** muss stimmen.
-
-**Fix** (`make_sess_pair()`): gemeinsame 2-B-Basis, `ch0=base+ctr`, `ch1=base+(ctr+1)`.
-Offline bit-genau verifiziert (a9-Frame byte-identisch zu cold2, außer uninit. Heap-Garbage
-@0x08). Scharfer Test gegen das Gerät steht aus. Transport (Discovery → Relay-Punch →
-KCP-Session), Krypto und App-Frame-Bau sind verifiziert; die sess-Kopplung war die letzte
-byte-belegte Abweichung zur echten App.
+**Schlussfolgerung:** der 144B-Trigger ist **geräteseitig** und aus Client-pcap + Client-`.so`
+nicht eindeutig ableitbar. Die relevante Lib-Kette (`OnRespP2PConnect → P2PTest MTU-/BW-Test
+→ TestOk → mtuTestOk → P2PManager::OnMtuTestOk → CQVEvent::Set` weckt den Stream-Aufbau)
+ist kartiert, aber die exakte Freigabebedingung liegt in der Geräte-Firmware. Nächster
+Schritt: frischer Frida-`sendto`/`recvfrom`-Mitschnitt EINER echten App-Session (paketgenauer
+Vergleich a9→144B). Transport, Krypto, App-Frame-Bau, beide LOGINs bleiben verifiziert.
 
 ## 8. Artefakte
 
