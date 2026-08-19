@@ -23,7 +23,7 @@ from .p2p import async_p2p_get_snapshot
 _LOGGER = logging.getLogger(__name__)
 
 # Minimum cache time in seconds to prevent flooding the door station on rapid dashboard refreshes
-SNAPSHOT_CACHE_TTL = 30.0
+SNAPSHOT_CACHE_TTL = 15.0
 
 
 async def async_setup_entry(
@@ -47,7 +47,6 @@ class BalterDoorbellCamera(Camera):
     _attr_has_entity_name = True
     _attr_icon = "mdi:doorbell-video"
     _attr_supported_features = CameraEntityFeature.ON_OFF
-    # Critical: Disable background polling so HA does not continuously occupy the intercom channel
     _attr_should_poll = False
 
     def __init__(

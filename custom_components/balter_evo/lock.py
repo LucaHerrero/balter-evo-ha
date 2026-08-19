@@ -29,7 +29,7 @@ async def async_setup_entry(
 ) -> None:
     """Create one lock entity per discovered door-release relay."""
     data = entry.runtime_data
-    pin = entry.data[CONF_DOOR_PIN]
+    pin = entry.data.get(CONF_DOOR_PIN, "")
     async_add_entities(BalterDoorLock(data.client, lock, pin) for lock in data.locks)
 
 
@@ -59,13 +59,17 @@ class BalterDoorLock(LockEntity):
         """Fetch a fresh device password and trigger the door-release relay via P2P."""
         try:
             dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
+            # Map 1-based subdev indices to 0-based hardware channels
+            door_idx = max(0, int(self._lock.get("door", 1)) - 1)
+            lock_idx = max(0, int(self._lock.get("locknumber", 1)) - 1)
+            
             success = await async_p2p_open_door(
                 self.hass,
                 self._lock["duid"],
                 dynamic_password,
                 self._pin,
-                door=self._lock["door"],
-                locknumber=self._lock["locknumber"],
+                door=door_idx,
+                locknumber=lock_idx,
             )
             if not success:
                 raise HomeAssistantError("Keine Bestätigung vom Türöffner empfangen")
