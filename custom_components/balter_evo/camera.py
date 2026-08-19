@@ -92,7 +92,14 @@ class BalterDoorbellCamera(Camera):
                 return self._last_image
 
             try:
-                dynamic_password = await self._client.get_dynamic_password(self._duid)
+                dynamic_password = self._device.get("dynamic_password") or ""
+                if not dynamic_password:
+                    try:
+                        dynamic_password = await self._client.get_dynamic_password(self._duid)
+                    except Exception as err:
+                        _LOGGER.debug("Could not refresh dynamic password from cloud: %s", err)
+                        dynamic_password = ""
+
                 image_bytes = await async_p2p_get_snapshot(
                     self.hass,
                     self._duid,

@@ -56,10 +56,17 @@ class BalterDoorLock(LockEntity):
         )
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        """Fetch a fresh device password and trigger the door-release relay via P2P."""
+        """Trigger the door-release relay via P2P."""
         _LOGGER.info("Door unlock requested for %s (%s)", self.name, self._lock["duid"])
         try:
-            dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
+            dynamic_password = self._lock.get("dynamic_password") or ""
+            if not dynamic_password:
+                try:
+                    dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
+                except Exception as err:
+                    _LOGGER.warning("Could not fetch dynamic password from cloud: %s", err)
+                    dynamic_password = ""
+            
             # Map 1-based subdev indices to 0-based hardware channels
             door_idx = max(0, int(self._lock.get("door", 1)) - 1)
             lock_idx = max(0, int(self._lock.get("locknumber", 1)) - 1)
