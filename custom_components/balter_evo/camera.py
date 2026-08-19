@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from typing import Any
 
@@ -19,6 +18,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BalterConfigEntry
 from .api import BalterCloudClient
 from .const import DOMAIN
+from .p2p import async_p2p_get_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -93,24 +93,18 @@ class BalterDoorbellCamera(Camera):
                 return self._last_image
 
             try:
-                image_bytes = await self.hass.async_add_executor_job(self._fetch_snapshot)
+                dynamic_password = await self._client.get_dynamic_password(self._duid)
+                image_bytes = await async_p2p_get_snapshot(
+                    self.hass,
+                    self._duid,
+                    dynamic_password,
+                    data_encode_key=self._device.get("data_encode_key"),
+                )
                 if image_bytes:
                     self._last_image = image_bytes
                     self._last_image_time = time.time()
                     return image_bytes
             except Exception as err:
-                _LOGGER.warning("Could not fetch snapshot for %s: %s", self._duid, err)
+                _LOGGER.warning("Could not fetch P2P snapshot for %s: %s", self._duid, err)
 
         return self._last_image
-
-    def _fetch_snapshot(self) -> bytes | None:
-        """Fetch snapshot synchronously and close session immediately."""
-        # Read from local verified snapshot if available
-        snapshot_file = self.hass.config.path("live_snapshot.jpg")
-        if os.path.exists(snapshot_file) and os.path.getsize(snapshot_file) > 0:
-            try:
-                with open(snapshot_file, "rb") as fh:
-                    return fh.read()
-            except OSError:
-                pass
-        return None

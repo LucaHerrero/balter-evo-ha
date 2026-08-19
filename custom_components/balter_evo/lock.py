@@ -1,9 +1,6 @@
 """Lock entities for each Balter EVO door-release relay.
 
-The hardware is a momentary door buzzer: unlocking energises the relay for a moment and
-it re-locks by itself. There is no way to query the physical state, so each entity is an
-optimistic lock that flips to "unlocked" on command and back to "locked" after a short
-delay. Locking is a no-op on the device (it auto-locks) and only resets the shown state.
+Uses the reverse-engineered UDP/KCP P2P protocol for direct, reliable hardware unlock.
 """
 from __future__ import annotations
 
@@ -20,6 +17,7 @@ from homeassistant.helpers.event import async_call_later
 from . import BalterConfigEntry
 from .api import BalterApiError, BalterCloudClient
 from .const import CONF_DOOR_PIN, DOMAIN, RELOCK_DELAY
+from .p2p import async_p2p_open_door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,16 +56,20 @@ class BalterDoorLock(LockEntity):
         )
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        """Fetch a fresh device password and trigger the door-release relay."""
+        """Fetch a fresh device password and trigger the door-release relay via P2P."""
         try:
             dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
-            await self._client.open_lock(
+            success = await async_p2p_open_door(
+                self.hass,
+                self._lock["duid"],
                 dynamic_password,
-                self._lock["door"],
-                self._lock["locknumber"],
                 self._pin,
+                door=self._lock["door"],
+                locknumber=self._lock["locknumber"],
             )
-        except BalterApiError as err:
+            if not success:
+                raise HomeAssistantError("Keine Bestätigung vom Türöffner empfangen")
+        except Exception as err:
             raise HomeAssistantError(f"Türöffnen fehlgeschlagen: {err}") from err
 
         self._attr_is_locked = False
