@@ -364,3 +364,29 @@ Vergleich a9→144B). Transport, Krypto, App-Frame-Bau, beide LOGINs bleiben ver
 - `downloads/p2p-capture/decoded/control.json` — entschlüsselter Steuerkanal
 - `downloads/p2p-open/open.pcap` — Mitschnitt eines echten Türöffnen-Vorgangs
 - `scratchpad/frida_aeskey.py`, `frida_mode.py` — AES-Key/IV/Modus (Herkunft des Keys)
+
+### 7e. Stream-Schicht in `liblive_player.so` geknackt (2026-08-19)
+
+Die a9/144B-Stufen-Logik liegt NICHT in `libqv-p2p-v2.so` (nur Transport), sondern in
+**`liblive_player.so`** (Quvii **QVNetSDK**, Quellpfad `.../QVNetSDK/quiistream.cpp`,
+15.481 Symbole). Die Live-View ist eine RTSP-artige Zustandsmaschine der Klasse
+`CQUIIStreamLive`/`CQUIIStreamBase` mit Zustandsfeld `@0x208`:
+
+```
+OnStart (state=0) -> SendOpen (URL+SHA256, CQVTimeout 1000ms)
+  -> SendSetup (cmd=0xA9, 32B = 0xa9 + 31x00, state=3)   <-- der "a9"-Frame
+  -> OnSendPlay (SHA256("...&&..."), EncryptData)         <-- Video-Start
+  -> Video (cmd=0xA0). OnWork/OnPolling takten die Uebergaenge (CQVTimeout::Check).
+```
+
+- **cmd-Bytes:** Client sendet `0xA9`=SETUP, `0x01`=LOGIN, `0xFE`=Control; Gerät antwortet
+  mit `0xA4`/`0xAA`/`0xFE`. Jeder empfangene Command wird per **`SHACheck` (SHA256)** verifiziert.
+- **a9/SETUP bit-genau bestätigt:** `SendSetup` baut exakt `0xa9`+31 Null-Bytes — identisch
+  zum Standalone-Nachbau. Das **144B ist die SETUP-Bestätigung** des Geräts (geschachteltes
+  App-Frame, spiegelt die Client-sess-Basis).
+
+**Konsequenz für den Blocker:** Damit sind ALLE Wire-Frames beider Schichten byte-identisch
+zum Standalone-Client verifiziert, und MQTT ist ausgeschlossen. Der fehlende 144B liegt allein
+an der **nativen Zustandsmaschinen-Kadenz** (CQVTimeout-getaktete Stufen, Mutex/Polling-Sende-
+Timing, KCP interval=10ms) — aus Python nicht reproduzierbar. Für die HA-Integration ist der
+Fallback über die native Lib (Frida-Aufruf der opendoor-Funktion) der praktikable Weg.
