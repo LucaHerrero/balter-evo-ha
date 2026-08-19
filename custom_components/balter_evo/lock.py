@@ -57,6 +57,7 @@ class BalterDoorLock(LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Fetch a fresh device password and trigger the door-release relay via P2P."""
+        _LOGGER.info("Door unlock requested for %s (%s)", self.name, self._lock["duid"])
         try:
             dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
             # Map 1-based subdev indices to 0-based hardware channels
@@ -74,6 +75,7 @@ class BalterDoorLock(LockEntity):
             if not success:
                 raise HomeAssistantError("Keine Bestätigung vom Türöffner empfangen")
         except Exception as err:
+            _LOGGER.error("P2P door unlock failed: %s", err)
             raise HomeAssistantError(f"Türöffnen fehlgeschlagen: {err}") from err
 
         self._attr_is_locked = False

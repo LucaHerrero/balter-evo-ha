@@ -472,6 +472,7 @@ def p2p_open_door_sync(
     locknumber: int = 0,
 ) -> bool:
     """Execute physical door unlock sequence over UDP/KCP (100% verified flow)."""
+    _LOGGER.info("Starting Balter EVO P2P unlock for duid=%s, door=%d, lock=%d", duid, door, locknumber)
     if not dynamic_password:
         dynamic_password = hashlib.md5((duid + oem + time.strftime("%Y%m%d")).encode()).hexdigest()[:8]
 
@@ -483,6 +484,7 @@ def p2p_open_door_sync(
     p2p_sess.p2pconnect()
     
     if not p2p_sess.got_addr.wait(timeout=10) or not p2p_sess.utd:
+        _LOGGER.error("P2P session discovery timed out for %s", duid)
         p2p_sess.close()
         return False
         
@@ -606,6 +608,7 @@ def p2p_open_door_sync(
                         cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, sess_bytes)
                         sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], cl_fr), src)
                         unlocked[0] = True
+                        _LOGGER.info("Door unlock command acknowledged by Balter EVO door station!")
 
     threading.Thread(target=rx_loop, daemon=True).start()
     
@@ -618,6 +621,7 @@ def p2p_open_door_sync(
         time.sleep(0.15)
         
     if not (ch[CH0]["myid"] and ch[CH1]["myid"]):
+        _LOGGER.error("P2P punch/handshake failed (CH0/CH1 IDs not received)")
         stop.set()
         sock.close()
         p2p_sess.close()
