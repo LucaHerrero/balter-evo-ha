@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
@@ -15,7 +16,7 @@ from .const import CONF_CLIENT_ID
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LOCK]
+PLATFORMS: list[Platform] = [Platform.LOCK, Platform.CAMERA]
 
 
 @dataclass
@@ -23,7 +24,8 @@ class BalterRuntimeData:
     """Runtime state shared with the platforms via ``entry.runtime_data``."""
 
     client: BalterCloudClient
-    locks: list[dict] = field(default_factory=list)
+    devices: list[dict[str, Any]] = field(default_factory=list)
+    locks: list[dict[str, Any]] = field(default_factory=list)
 
 
 type BalterConfigEntry = ConfigEntry[BalterRuntimeData]
@@ -47,7 +49,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bo
     except BalterApiError as err:
         raise ConfigEntryNotReady(str(err)) from err
 
-    locks: list[dict] = []
+    locks: list[dict[str, Any]] = []
     for device in devices:
         try:
             device_locks = await client.get_subdev_list(device["duid"])
@@ -61,13 +63,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bo
                     "duid": device["duid"],
                     "device_name": device["name"],
                     "device_model": device["model"],
+                    "data_encode_key": device.get("data_encode_key"),
                 }
             )
 
-    if not locks:
-        raise ConfigEntryNotReady("No door locks reported by the account yet")
-
-    entry.runtime_data = BalterRuntimeData(client=client, locks=locks)
+    entry.runtime_data = BalterRuntimeData(client=client, devices=devices, locks=locks)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
