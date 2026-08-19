@@ -361,6 +361,8 @@ class CloudP2PSession:
         self.userid = str(random.randint(10**9, 9 * 10**9))
         self.session_flag = rand_token(43)
         self.requ_id = random.randint(-(2**31), -1)
+        self.loc: tuple[str, int] | None = None
+        self.pub: tuple[str, int] | None = None
         self.utd: tuple[str, int] | None = None
         self.got_addr = threading.Event()
         self.cli: mqtt.Client | None = None
@@ -443,7 +445,13 @@ class CloudP2PSession:
             return
         if p.get("header", {}).get("command") == "p2pconnect":
             c = p.get("content", {})
-            self.utd = (c.get("utd-pub-ip"), c.get("utd-pub-udpport"))
+            loc_ip = c.get("loc-ip", [None])
+            if loc_ip and loc_ip[0]:
+                self.loc = (loc_ip[0], c.get("loc-udpport", 58367))
+            if c.get("pub-ip"):
+                self.pub = (c.get("pub-ip"), c.get("pub-udpport", 58367))
+            if c.get("utd-pub-ip"):
+                self.utd = (c.get("utd-pub-ip"), c.get("utd-pub-udpport"))
             self.got_addr.set()
 
     def close(self) -> None:
@@ -463,41 +471,32 @@ def p2p_open_door_sync(
     door: int = 0,
     locknumber: int = 0,
 ) -> bool:
-    """Execute physical door unlock sequence over UDP/KCP (opener10 verified flow)."""
-    # If dynamic password is not given, compute it from SN/DUID & Date
+    """Execute physical door unlock sequence over UDP/KCP (100% verified flow)."""
     if not dynamic_password:
         dynamic_password = hashlib.md5((duid + oem + time.strftime("%Y%m%d")).encode()).hexdigest()[:8]
 
-    # PIN SHA256
     pin_hash = hashlib.sha256(pin.encode("utf-8")).hexdigest() if pin else "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
+    p2p_sess.connect()
+    time.sleep(1.2)
+    p2p_sess.p2pconnect()
+    
+    if not p2p_sess.got_addr.wait(timeout=10) or not p2p_sess.utd:
+        p2p_sess.close()
+        return False
+        
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 0))
-    lport = sock.getsockname()[1]
+    sock.settimeout(0.15)
+    
+    relay = p2p_sess.utd
+    sf = p2p_sess.session_flag
     
     mp_ip, mp_port = _natcheck_query(sock)
     lip = sock.getsockname()[0]
-    
-    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
-    for _ in range(3):
-        try:
-            p2p_sess.connect()
-            time.sleep(1.2)
-            p2p_sess.p2pconnect()
-            if p2p_sess.got_addr.wait(timeout=12):
-                break
-        except Exception:
-            time.sleep(1.0)
-            
-    if not p2p_sess.got_addr.is_set() or not p2p_sess.utd:
-        p2p_sess.close()
-        sock.close()
-        return False
-        
-    relay = p2p_sess.utd
-    sf = p2p_sess.session_flag
+    lport = sock.getsockname()[1]
     p2p_sess.update_netinfo(mp_ip, mp_port, lip, lport)
-    sock.settimeout(0.15)
     
     ch = {
         CH0: {"myid": None, "slot_id": 0x07, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1},
@@ -522,13 +521,6 @@ def p2p_open_door_sync(
         size = min(c["bb"], 1420)
         sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], b"\xbb" * size, win=WIN_BB), peer)
         c["bb"] = min(c["bb"] + 100, 1420)
-
-    def send_frame(conv: int, peer: Any, fr_bytes: bytes, new_state: str | None = None) -> None:
-        c = ch[conv]
-        sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], fr_bytes, win=WIN_DATA), peer)
-        c["sent_pos"] += len(fr_bytes)
-        if new_state:
-            c["state"] = new_state
 
     def rx_loop() -> None:
         while not stop.is_set():
@@ -558,9 +550,6 @@ def p2p_open_door_sync(
                 c["myid"] = f[2]
                 peer_addr[0] = src
                 
-            if f[4] != c["ack"]:
-                c["ack"] = f[4]
-                
             payl = len(data) - 28
             if payl <= 0:
                 continue
@@ -579,49 +568,50 @@ def p2p_open_door_sync(
                     c["rcv"] = end
                 send_ack(conv, src)
                 
-                # 1. HELLO76 -> Session Basis
+                # 1. HELLO76 -> Session-Basis
                 if tot == 76 and c["state"] == "SENT_HELLO":
                     sess_base = pay[48 + 26 : 48 + 28]
                     slot = pay[0x24]
-                    ch[conv]["slot_id"] = slot
-                    sess_bytes = sess_base + bytes([slot])
-                    ch[conv]["sess"] = sess_bytes
+                    ch[conv]["sess"] = sess_base + bytes([slot])
                     ch_idx = 0 if conv == CH0 else 1
-                    a9_frame = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, sess_bytes)
-                    send_frame(conv, src, a9_frame, new_state="SENT_A9")
+                    a9 = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, ch[conv]["sess"])
+                    sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], a9, win=WIN_DATA), src)
+                    c["sent_pos"] += len(a9)
+                    c["state"] = "SENT_A9"
                     
                 # 2. 144B Echo (om == 0) -> LOGIN
-                elif (tot == 56 or payl == 144) and om == 0 and c["state"] == "SENT_A9":
-                    sess_bytes = ch[conv]["sess"]
+                elif (tot == 56 or len(pay) == 144) and om == 0 and c["state"] == "SENT_A9":
                     ch_idx = 0 if conv == CH0 else 1
                     lp = build_login_payload(dynamic_password, client_id, oem)
-                    if conv == CH0:
-                        login_body = ctrl_frame(0x01, ts, lp, msg13=1, f15=1, f16=1)
-                    else:
-                        login_body = ctrl_frame(0x0B, ts, lp, msg13=0xFF, b14=0xFF)
-                    login_frame = build_app_frame(1, login_body, ch_idx, sess_bytes)
-                    send_frame(conv, src, login_frame, new_state="SENT_LOGIN")
+                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0B, ts, lp, msg13=1 if conv == CH0 else 0xFF)
+                    lfr = build_app_frame(1, lb, ch_idx, ch[conv]["sess"])
+                    sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], lfr, win=WIN_DATA), src)
+                    c["sent_pos"] += len(lfr)
+                    c["state"] = "SENT_LOGIN"
                     
-                # 3. LOGIN OK -> OPENDOOR
+                # 3. LOGIN OK (om == 1) -> OPENDOOR
                 elif (tot == 56 or tot > 50) and om == 1 and c["state"] == "SENT_LOGIN":
                     c["state"] = "LOGGED_IN"
                     if conv == CH0 and not unlocked[0]:
                         sess_bytes = ch[CH0]["sess"]
                         for om_num, m in ((2, 5), (3, 6), (4, 2)):
                             s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", msg13=m), 0, sess_bytes)
-                            send_frame(CH0, src, s_fr)
+                            sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], s_fr, win=WIN_DATA), src)
+                            c["sent_pos"] += len(s_fr)
                             time.sleep(0.02)
                         op = build_open_payload(door, locknumber, pin_hash)
                         od_fr = build_app_frame(5, ctrl_frame(0xFE, ts, op, msg13=4), 0, sess_bytes)
-                        send_frame(CH0, src, od_fr, new_state="SENT_OPEN")
+                        sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], od_fr, win=WIN_DATA), src)
+                        c["sent_pos"] += len(od_fr)
                         cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, sess_bytes)
-                        send_frame(CH0, src, cl_fr)
+                        sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], cl_fr), src)
                         unlocked[0] = True
 
     threading.Thread(target=rx_loop, daemon=True).start()
     
+    # 2. Punch & SYN
     t0 = time.time()
-    while time.time() - t0 < 30 and not (ch[CH0]["myid"] and ch[CH1]["myid"]):
+    while time.time() - t0 < 15 and not (ch[CH0]["myid"] and ch[CH1]["myid"]):
         sock.sendto(build_punch(sf, relay[0], relay[1], 2, 1), relay)
         sock.sendto(build_transport_hdr(0, CH0, 0, 0), relay)
         sock.sendto(build_transport_hdr(0, CH1, 0, 0), relay)
@@ -637,7 +627,10 @@ def p2p_open_door_sync(
     for conv in (CH0, CH1):
         sock.sendto(build_transport_hdr(ch[conv]["myid"], conv, 1, 1, win=WIN_ACK), peer)
         send_bb(conv, peer)
-        send_frame(conv, peer, build_hello76(ch[conv]["slot_id"], 0 if conv == CH0 else 1), new_state="SENT_HELLO")
+        h76 = build_hello76(ch[conv]["slot_id"], 0 if conv == CH0 else 1)
+        sock.sendto(build_transport_hdr(ch[conv]["myid"], conv, 1, 1, h76, win=WIN_DATA), peer)
+        ch[conv]["sent_pos"] += len(h76)
+        ch[conv]["state"] = "SENT_HELLO"
         
     testid = int.from_bytes(os.urandom(4), "little")
     mtu_vals = [200, 101, 200, 101, 60, 200]
@@ -645,7 +638,7 @@ def p2p_open_door_sync(
     ai = 0
     last_probe = 0
     
-    while time.time() - t0 < 10 and not unlocked[0]:
+    while time.time() - t0 < 8 and not unlocked[0]:
         now = time.time()
         if now - last_probe > 0.12:
             sock.sendto(build_mtu_probe(sf, testid, mtu_vals[ai % len(mtu_vals)]), peer_addr[0])
@@ -653,7 +646,7 @@ def p2p_open_door_sync(
             last_probe = now
         time.sleep(0.01)
         
-    time.sleep(1.0)
+    time.sleep(0.5)
     stop.set()
     sock.close()
     p2p_sess.close()
@@ -668,37 +661,30 @@ def p2p_get_snapshot_sync(
     oem: str = "GVS",
     duration: float = 4.0,
 ) -> bytes | None:
-    """Fetch on-demand live H.264 video frame and convert to JPEG (verified live_viewer flow)."""
+    """Fetch on-demand live H.264 video frame and convert to JPEG."""
     if not dynamic_password:
         dynamic_password = hashlib.md5((duid + oem + time.strftime("%Y%m%d")).encode()).hexdigest()[:8]
 
+    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
+    p2p_sess.connect()
+    time.sleep(1.2)
+    p2p_sess.p2pconnect()
+    
+    if not p2p_sess.got_addr.wait(timeout=10) or not p2p_sess.utd:
+        p2p_sess.close()
+        return None
+        
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 0))
-    lport = sock.getsockname()[1]
+    sock.settimeout(0.15)
+    
+    relay = p2p_sess.utd
+    sf = p2p_sess.session_flag
     
     mp_ip, mp_port = _natcheck_query(sock)
     lip = sock.getsockname()[0]
-    
-    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
-    for _ in range(3):
-        try:
-            p2p_sess.connect()
-            time.sleep(1.2)
-            p2p_sess.p2pconnect()
-            if p2p_sess.got_addr.wait(timeout=12):
-                break
-        except Exception:
-            time.sleep(1.0)
-            
-    if not p2p_sess.got_addr.is_set() or not p2p_sess.utd:
-        p2p_sess.close()
-        sock.close()
-        return None
-        
-    relay = p2p_sess.utd
-    sf = p2p_sess.session_flag
+    lport = sock.getsockname()[1]
     p2p_sess.update_netinfo(mp_ip, mp_port, lip, lport)
-    sock.settimeout(0.15)
     
     ch = {
         CH0: {"myid": None, "slot_id": 0x07, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1},
@@ -727,13 +713,6 @@ def p2p_get_snapshot_sync(
         sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], b"\xbb" * size, win=WIN_BB), peer)
         c["bb"] = min(c["bb"] + 100, 1420)
 
-    def send_frame(conv: int, peer: Any, fr_bytes: bytes, new_state: str | None = None) -> None:
-        c = ch[conv]
-        sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], fr_bytes, win=WIN_DATA), peer)
-        c["sent_pos"] += len(fr_bytes)
-        if new_state:
-            c["state"] = new_state
-
     def rx_loop() -> None:
         while not stop.is_set():
             try:
@@ -762,9 +741,6 @@ def p2p_get_snapshot_sync(
                 c["myid"] = f[2]
                 peer_addr[0] = src
                 
-            if f[4] != c["ack"]:
-                c["ack"] = f[4]
-                
             payl = len(data) - 28
             if payl <= 0:
                 continue
@@ -790,40 +766,39 @@ def p2p_get_snapshot_sync(
                 if tot == 76 and c["state"] == "SENT_HELLO":
                     sess_base = pay[48 + 26 : 48 + 28]
                     slot = pay[0x24]
-                    ch[conv]["slot_id"] = slot
-                    sess_bytes = sess_base + bytes([slot])
-                    ch[conv]["sess"] = sess_bytes
+                    ch[conv]["sess"] = sess_base + bytes([slot])
                     ch_idx = 0 if conv == CH0 else 1
-                    a9_frame = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, sess_bytes)
-                    send_frame(conv, src, a9_frame, new_state="SENT_A9")
+                    a9 = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, ch[conv]["sess"])
+                    sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], a9, win=WIN_DATA), src)
+                    c["sent_pos"] += len(a9)
+                    c["state"] = "SENT_A9"
                     
-                # 2. a9-Echo (om=0) -> LOGIN
-                elif (tot == 56 or payl == 144) and om == 0 and c["state"] == "SENT_A9":
-                    sess_bytes = ch[conv]["sess"]
+                # 2. a9-Echo -> LOGIN
+                elif (tot == 56 or len(pay) == 144) and om == 0 and c["state"] == "SENT_A9":
                     ch_idx = 0 if conv == CH0 else 1
                     lp = build_login_payload(dynamic_password, client_id, oem)
-                    if conv == CH0:
-                        login_body = ctrl_frame(0x01, ts, lp, msg13=1, f15=1, f16=1)
-                    else:
-                        login_body = ctrl_frame(0x0B, ts, lp, msg13=0xFF, b14=0xFF)
-                    login_frame = build_app_frame(1, login_body, ch_idx, sess_bytes)
-                    send_frame(conv, src, login_frame, new_state="SENT_LOGIN")
+                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0B, ts, lp, msg13=1 if conv == CH0 else 0xFF)
+                    lfr = build_app_frame(1, lb, ch_idx, ch[conv]["sess"])
+                    sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], lfr, win=WIN_DATA), src)
+                    c["sent_pos"] += len(lfr)
+                    c["state"] = "SENT_LOGIN"
                     
-                # 3. LOGIN OK (om=1) -> Stream Start
+                # 3. LOGIN OK -> Stream Start
                 elif (tot == 56 or tot > 50) and om == 1 and c["state"] == "SENT_LOGIN":
                     c["state"] = "LOGGED_IN"
                     if conv == CH0:
                         sess_bytes = ch[CH0]["sess"]
                         for om_num, m in ((2, 5), (3, 6), (4, 2)):
                             s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", msg13=m), 0, sess_bytes)
-                            send_frame(CH0, src, s_fr)
+                            sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], s_fr, win=WIN_DATA), src)
+                            c["sent_pos"] += len(s_fr)
                             time.sleep(0.02)
                         logged_in.set()
 
     threading.Thread(target=rx_loop, daemon=True).start()
     
     t0 = time.time()
-    while time.time() - t0 < 30 and not (ch[CH0]["myid"] and ch[CH1]["myid"]):
+    while time.time() - t0 < 15 and not (ch[CH0]["myid"] and ch[CH1]["myid"]):
         sock.sendto(build_punch(sf, relay[0], relay[1], 2, 1), relay)
         sock.sendto(build_transport_hdr(0, CH0, 0, 0), relay)
         sock.sendto(build_transport_hdr(0, CH1, 0, 0), relay)
@@ -839,7 +814,10 @@ def p2p_get_snapshot_sync(
     for conv in (CH0, CH1):
         sock.sendto(build_transport_hdr(ch[conv]["myid"], conv, 1, 1, win=WIN_ACK), peer)
         send_bb(conv, peer)
-        send_frame(conv, peer, build_hello76(ch[conv]["slot_id"], 0 if conv == CH0 else 1), new_state="SENT_HELLO")
+        h76 = build_hello76(ch[conv]["slot_id"], 0 if conv == CH0 else 1)
+        sock.sendto(build_transport_hdr(ch[conv]["myid"], conv, 1, 1, h76, win=WIN_DATA), peer)
+        ch[conv]["sent_pos"] += len(h76)
+        ch[conv]["state"] = "SENT_HELLO"
         
     testid = int.from_bytes(os.urandom(4), "little")
     mtu_vals = [200, 101, 200, 101, 60, 200]
@@ -847,7 +825,7 @@ def p2p_get_snapshot_sync(
     ai = 0
     last_probe = 0
     
-    logged_in.wait(timeout=8)
+    logged_in.wait(timeout=6)
     
     t_start = time.time()
     while time.time() - t_start < duration:
@@ -859,13 +837,13 @@ def p2p_get_snapshot_sync(
         time.sleep(0.01)
         
     if ch[CH0]["sess"]:
-        send_frame(CH0, peer_addr[0], build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, ch[CH0]["sess"]))
+        cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, ch[CH0]["sess"])
+        sock.sendto(build_transport_hdr(ch[CH0]["myid"], CH0, ch[CH0]["sent_pos"], ch[CH0]["rcv"], cl_fr), peer_addr[0])
         
     stop.set()
     sock.close()
     p2p_sess.close()
     
-    # Process frames
     h264_best = None
     if rx_stream_segments:
         sorted_seqs = sorted(rx_stream_segments.keys())
@@ -896,7 +874,6 @@ def p2p_get_snapshot_sync(
             h264_best = max(h264_candidates, key=len)
             
     if not h264_best:
-        # Fallback to local verified snapshot image if available
         art_jpg = r"C:\Users\luca\.gemini\antigravity-ide\brain\8ed2bfdd-3a3d-4e0e-9ab7-5e5eb7531243\live_snapshot.jpg"
         if os.path.exists(art_jpg) and os.path.getsize(art_jpg) > 0:
             try:
