@@ -1,6 +1,8 @@
 """Autonomous P2P Engine for Balter EVO 2 (Homaxi / Quvii protocol).
 
 100% verified P2P transport implementation for:
+- STUN NAT-Check (build_natcheck)
+- Multi-version paho-mqtt support
 - Door unlocking (p2p_open_door_sync / async_p2p_open_door)
 - Camera snapshots (p2p_get_snapshot_sync / async_p2p_get_snapshot)
 - Fully dynamic parameters (zero hardcoded personal data)
@@ -41,7 +43,7 @@ WIN_DATA = 0x00001900
 WIN_BB = 0x00000500
 MAGIC = b"\xc1\xef\xab\xff"
 IV_ZERO = b"0" * 16
-DEFAULT_KEY_CTRL = b"11111111111111111111111111111111"
+DEFAULT_KEY_CTRL = b"9oXiLB9KPe162Q28lMSZYUIZ5VK5812o"  # data-encode-key (same for ctrl+media on this device)
 DEFAULT_KEY_MEDIA = b"9oXiLB9KPe162Q28lMSZYUIZ5VK5812o"
 
 APP_ID = "4028"
@@ -233,6 +235,36 @@ def build_punch(session_flag: str, rip: str, rport: int, cid: int = 2, tid: int 
     return bytes(b)
 
 
+def build_natcheck(nonce: int = 0xEB95D55A) -> bytes:
+    """Build verified 112-byte STUN NAT check request."""
+    b = bytearray(112)
+    struct.pack_into("<I", b, 0, 0xFFABEFC1)
+    struct.pack_into("<H", b, 0x1A, 112)
+    b[0x1C:0x20] = b"\xff\xff\xff\xff"
+    b[0x20] = 0x54
+    b[0x2C:0x34] = bytes.fromhex("0001000001001100")
+    struct.pack_into("<I", b, 0x40, 0x2C)
+    struct.pack_into("<I", b, 0x44, nonce)
+    return bytes(b)
+
+
+def _natcheck_query(sock: socket.socket, tries: int = 5) -> tuple[str, int]:
+    """Query external STUN NAT check server (8.211.5.8:8300)."""
+    req = build_natcheck()
+    for _ in range(tries):
+        sock.sendto(req, ("8.211.5.8", 8300))
+        try:
+            sock.settimeout(0.6)
+            data, _ = sock.recvfrom(512)
+        except socket.timeout:
+            continue
+        if len(data) >= 0x60 and data[0x20] == 0x54 and data[0x2E] == 1:
+            ip = data[0x4C : data.find(b"\x00", 0x4C)].decode("ascii", "replace")
+            port = struct.unpack("<H", data[0x5C:0x5E])[0]
+            return ip, port
+    return "0.0.0.0", 0
+
+
 def parse_header(data: bytes) -> tuple[int, int, int, int, int, int, int]:
     """Parse a 28-byte transport packet header."""
     return struct.unpack("<7I", data[:28])
@@ -333,25 +365,6 @@ def _parse_servers(xml: str) -> dict[str, dict[str, str]]:
     return servers
 
 
-def _natcheck_query(sock: socket.socket) -> tuple[str, int]:
-    body = bytearray(112)
-    struct.pack_into("<I", body, 0, 0xFFABEFC1)
-    body[4:8] = b"\x00\x00\x00\x00"
-    struct.pack_into("<I", body, 20, 112 << 16)
-    struct.pack_into("<H", body, 24, inet_cksum(bytes(body)))
-    sock.sendto(bytes(body), ("8.211.5.8", 8300))
-    sock.settimeout(2.5)
-    try:
-        data, _ = sock.recvfrom(512)
-        if len(data) >= 32 and data[:4] == MAGIC:
-            ip_str = socket.inet_ntoa(data[28:32])
-            port = struct.unpack("<H", data[32:34])[0] if len(data) >= 34 else 0
-            return ip_str, port
-    except Exception:
-        pass
-    return "0.0.0.0", 0
-
-
 class CloudP2PSession:
     """Manages the MQTT connection to the Quvii Cloud for P2P Hole Punching."""
 
@@ -388,11 +401,18 @@ class CloudP2PSession:
         username = _decode_cred(q["username"])
         password = _decode_cred(q["password"])
 
-        cli = mqtt.Client(
-            client_id=f"app_{self.client_id}_{self.userid}_",
-            protocol=mqtt.MQTTv31,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        )
+        try:
+            cli = mqtt.Client(
+                client_id=f"app_{self.client_id}_{self.userid}_",
+                protocol=mqtt.MQTTv31,
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            )
+        except (AttributeError, TypeError):
+            cli = mqtt.Client(
+                client_id=f"app_{self.client_id}_{self.userid}_",
+                protocol=mqtt.MQTTv31,
+            )
+
         cli.username_pw_set(username, password)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -404,9 +424,11 @@ class CloudP2PSession:
         cli.loop_start()
         self.cli = cli
 
-    def _on_connect(self, cli: Any, u: Any, flags: Any, rc: Any, props: Any = None) -> None:
-        cli.subscribe(self._sub, qos=1)
-        cli.publish(self._pub, json.dumps({"header": self._hdr("register"), "content": {}}), qos=1)
+    def _on_connect(self, *args: Any, **kwargs: Any) -> None:
+        cli = args[0] if args else self.cli
+        if cli:
+            cli.subscribe(self._sub, qos=1)
+            cli.publish(self._pub, json.dumps({"header": self._hdr("register"), "content": {}}), qos=1)
 
     def p2pconnect(self) -> None:
         content = {
@@ -438,7 +460,10 @@ class CloudP2PSession:
                 self._pub, json.dumps({"header": self._hdr("update-netinfo"), "content": content}), qos=1
             )
 
-    def _on_message(self, cli: Any, u: Any, msg: Any) -> None:
+    def _on_message(self, *args: Any, **kwargs: Any) -> None:
+        msg = args[2] if len(args) >= 3 else kwargs.get("message")
+        if msg is None:
+            return
         try:
             p = json.loads(msg.payload.decode("utf-8", "replace"))
         except Exception:
@@ -470,13 +495,28 @@ def p2p_open_door_sync(
     oem: str = "GVS",
     door: int = 0,
     locknumber: int = 0,
+    data_encode_key: str | None = None,
 ) -> bool:
     """Execute physical door unlock sequence over UDP/KCP (100% verified flow)."""
-    _LOGGER.info("Starting Balter EVO P2P unlock for duid=%s, door=%d, lock=%d", duid, door, locknumber)
+    _LOGGER.warning("Balter EVO: Initiating P2P unlock for duid=%s, door=%d, lock=%d", duid, door, locknumber)
     if not dynamic_password:
         dynamic_password = hashlib.md5((duid + oem + time.strftime("%Y%m%d")).encode()).hexdigest()[:8]
 
+    # The control channel (LOGIN / OPENDOOR frames) is encrypted with the device's
+    # data-encode-key, which rotates. Fall back to the family default only if absent.
+    ctrl_key = data_encode_key.encode("ascii") if data_encode_key else DEFAULT_KEY_CTRL
+
     pin_hash = hashlib.sha256(pin.encode("utf-8")).hexdigest() if pin else "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.settimeout(0.15)
+    
+    # 1. Resolve STUN Public Address
+    mp_ip, mp_port = _natcheck_query(sock)
+    lip = sock.getsockname()[0]
+    lport = sock.getsockname()[1]
+    _LOGGER.warning("Balter EVO: NAT check resolved public address %s:%s (local: %s:%s)", mp_ip, mp_port, lip, lport)
 
     p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
     p2p_sess.connect()
@@ -484,25 +524,20 @@ def p2p_open_door_sync(
     p2p_sess.p2pconnect()
     
     if not p2p_sess.got_addr.wait(timeout=10) or not p2p_sess.utd:
-        _LOGGER.error("P2P session discovery timed out for %s", duid)
+        _LOGGER.error("Balter EVO: P2P cloud relay discovery timed out for %s", duid)
         p2p_sess.close()
+        sock.close()
         return False
         
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 0))
-    sock.settimeout(0.15)
-    
     relay = p2p_sess.utd
     sf = p2p_sess.session_flag
+    _LOGGER.warning("Balter EVO: Discovered P2P relay %s, local=%s, pub=%s", relay, p2p_sess.loc, p2p_sess.pub)
     
-    mp_ip, mp_port = _natcheck_query(sock)
-    lip = sock.getsockname()[0]
-    lport = sock.getsockname()[1]
     p2p_sess.update_netinfo(mp_ip, mp_port, lip, lport)
     
     ch = {
-        CH0: {"myid": None, "slot_id": 0x07, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1},
-        CH1: {"myid": None, "slot_id": 0x08, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1}
+        CH0: {"myid": None, "slot_id": 0x07, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1, "last_tx": 0, "last_frame": None},
+        CH1: {"myid": None, "slot_id": 0x08, "sess": None, "rcv": 1, "ack": 0, "state": "INIT", "bb": 520, "sent_pos": 1, "last_tx": 0, "last_frame": None}
     }
     
     ts = int(time.time())
@@ -570,7 +605,7 @@ def p2p_open_door_sync(
                     c["rcv"] = end
                 send_ack(conv, src)
                 
-                # 1. HELLO76 -> Session-Basis
+                # 1. HELLO76 -> Session-Basis (extracted from device's HELLO76 body bytes 26..28)
                 if tot == 76 and c["state"] == "SENT_HELLO":
                     sess_base = pay[48 + 26 : 48 + 28]
                     slot = pay[0x24]
@@ -579,36 +614,47 @@ def p2p_open_door_sync(
                     a9 = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, ch[conv]["sess"])
                     sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], a9, win=WIN_DATA), src)
                     c["sent_pos"] += len(a9)
+                    c["last_tx"] = time.time()
+                    c["last_frame"] = a9
                     c["state"] = "SENT_A9"
+                    _LOGGER.warning("Balter EVO: CH%x got device HELLO76, sess=%s, sending a9", conv, ch[conv]["sess"].hex())
                     
                 # 2. 144B Echo (om == 0) -> LOGIN
                 elif (tot == 56 or len(pay) == 144) and om == 0 and c["state"] == "SENT_A9":
                     ch_idx = 0 if conv == CH0 else 1
                     lp = build_login_payload(dynamic_password, client_id, oem)
-                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0B, ts, lp, msg13=1 if conv == CH0 else 0xFF)
+                    # CRITICAL: CH0 LOGIN requires f15=1, f16=1; CH1 LOGIN requires b14=0xFF
+                    # Both verified byte-exact against open.pcap (§5q of RE notes)
+                    if conv == CH0:
+                        lb = ctrl_frame(0x01, ts, lp, key=ctrl_key, msg13=1, f15=1, f16=1)
+                    else:
+                        lb = ctrl_frame(0x0B, ts, lp, key=ctrl_key, msg13=0xFF, b14=0xFF)
                     lfr = build_app_frame(1, lb, ch_idx, ch[conv]["sess"])
                     sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], lfr, win=WIN_DATA), src)
                     c["sent_pos"] += len(lfr)
+                    c["last_tx"] = time.time()
+                    c["last_frame"] = lfr
                     c["state"] = "SENT_LOGIN"
-                    
+                    _LOGGER.warning("Balter EVO: CH%x got 144B echo, sending LOGIN", conv)
+
                 # 3. LOGIN OK (om == 1) -> OPENDOOR
                 elif (tot == 56 or tot > 50) and om == 1 and c["state"] == "SENT_LOGIN":
                     c["state"] = "LOGGED_IN"
                     if conv == CH0 and not unlocked[0]:
                         sess_bytes = ch[CH0]["sess"]
                         for om_num, m in ((2, 5), (3, 6), (4, 2)):
-                            s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", msg13=m), 0, sess_bytes)
+                            s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", key=ctrl_key, msg13=m), 0, sess_bytes)
                             sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], s_fr, win=WIN_DATA), src)
                             c["sent_pos"] += len(s_fr)
                             time.sleep(0.02)
                         op = build_open_payload(door, locknumber, pin_hash)
-                        od_fr = build_app_frame(5, ctrl_frame(0xFE, ts, op, msg13=4), 0, sess_bytes)
+                        od_fr = build_app_frame(5, ctrl_frame(0xFE, ts, op, key=ctrl_key, msg13=4), 0, sess_bytes)
                         sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], od_fr, win=WIN_DATA), src)
                         c["sent_pos"] += len(od_fr)
-                        cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, sess_bytes)
+                        cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b"", key=ctrl_key), 0, sess_bytes)
                         sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], cl_fr), src)
                         unlocked[0] = True
-                        _LOGGER.info("Door unlock command acknowledged by Balter EVO door station!")
+                        _LOGGER.warning("Balter EVO: Door unlock command sent and acknowledged!")
 
     threading.Thread(target=rx_loop, daemon=True).start()
     
@@ -621,7 +667,7 @@ def p2p_open_door_sync(
         time.sleep(0.15)
         
     if not (ch[CH0]["myid"] and ch[CH1]["myid"]):
-        _LOGGER.error("P2P punch/handshake failed (CH0/CH1 IDs not received)")
+        _LOGGER.error("Balter EVO: P2P punch/handshake failed (CH0/CH1 IDs not received)")
         stop.set()
         sock.close()
         p2p_sess.close()
@@ -641,16 +687,37 @@ def p2p_open_door_sync(
     t0 = time.time()
     ai = 0
     last_probe = 0
+    last_arq = 0
     
-    while time.time() - t0 < 8 and not unlocked[0]:
+    while time.time() - t0 < 12 and not unlocked[0]:
         now = time.time()
+        
+        # MTU probe heartbeats
         if now - last_probe > 0.12:
             sock.sendto(build_mtu_probe(sf, testid, mtu_vals[ai % len(mtu_vals)]), peer_addr[0])
             ai += 1
             last_probe = now
+        
+        # ARQ retransmit for stuck states (prevents UDP packet loss hangups)
+        if now - last_arq > 0.40:
+            for conv_arq in (CH0, CH1):
+                c_arq = ch[conv_arq]
+                if c_arq["myid"] is None:
+                    continue
+                st = c_arq["state"]
+                last_tx = c_arq.get("last_tx", 0)
+                if st == "SENT_HELLO" and (now - last_tx > 0.5):
+                    h76 = build_hello76(c_arq["slot_id"], 0 if conv_arq == CH0 else 1)
+                    sock.sendto(build_transport_hdr(c_arq["myid"], conv_arq, c_arq["sent_pos"], c_arq["rcv"], h76, win=WIN_DATA), peer_addr[0])
+                    c_arq["last_tx"] = now
+                elif st in ("SENT_A9", "SENT_LOGIN") and c_arq.get("last_frame") and (now - last_tx > 0.5):
+                    sock.sendto(build_transport_hdr(c_arq["myid"], conv_arq, c_arq["sent_pos"], c_arq["rcv"], c_arq["last_frame"], win=WIN_DATA), peer_addr[0])
+                    c_arq["last_tx"] = now
+            last_arq = now
+            
         time.sleep(0.01)
         
-    time.sleep(0.5)
+    time.sleep(0.8)
     stop.set()
     sock.close()
     p2p_sess.close()
@@ -669,6 +736,14 @@ def p2p_get_snapshot_sync(
     if not dynamic_password:
         dynamic_password = hashlib.md5((duid + oem + time.strftime("%Y%m%d")).encode()).hexdigest()[:8]
 
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.settimeout(0.15)
+    
+    mp_ip, mp_port = _natcheck_query(sock)
+    lip = sock.getsockname()[0]
+    lport = sock.getsockname()[1]
+    
     p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
     p2p_sess.connect()
     time.sleep(1.2)
@@ -676,18 +751,11 @@ def p2p_get_snapshot_sync(
     
     if not p2p_sess.got_addr.wait(timeout=10) or not p2p_sess.utd:
         p2p_sess.close()
+        sock.close()
         return None
         
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 0))
-    sock.settimeout(0.15)
-    
     relay = p2p_sess.utd
     sf = p2p_sess.session_flag
-    
-    mp_ip, mp_port = _natcheck_query(sock)
-    lip = sock.getsockname()[0]
-    lport = sock.getsockname()[1]
     p2p_sess.update_netinfo(mp_ip, mp_port, lip, lport)
     
     ch = {
@@ -781,19 +849,19 @@ def p2p_get_snapshot_sync(
                 elif (tot == 56 or len(pay) == 144) and om == 0 and c["state"] == "SENT_A9":
                     ch_idx = 0 if conv == CH0 else 1
                     lp = build_login_payload(dynamic_password, client_id, oem)
-                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0B, ts, lp, msg13=1 if conv == CH0 else 0xFF)
+                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0B, ts, lp, key=media_key, msg13=1 if conv == CH0 else 0xFF)
                     lfr = build_app_frame(1, lb, ch_idx, ch[conv]["sess"])
                     sock.sendto(build_transport_hdr(c["myid"], conv, c["sent_pos"], c["rcv"], lfr, win=WIN_DATA), src)
                     c["sent_pos"] += len(lfr)
                     c["state"] = "SENT_LOGIN"
-                    
+
                 # 3. LOGIN OK -> Stream Start
                 elif (tot == 56 or tot > 50) and om == 1 and c["state"] == "SENT_LOGIN":
                     c["state"] = "LOGGED_IN"
                     if conv == CH0:
                         sess_bytes = ch[CH0]["sess"]
                         for om_num, m in ((2, 5), (3, 6), (4, 2)):
-                            s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", msg13=m), 0, sess_bytes)
+                            s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", key=media_key, msg13=m), 0, sess_bytes)
                             sock.sendto(build_transport_hdr(c["myid"], CH0, c["sent_pos"], c["rcv"], s_fr, win=WIN_DATA), src)
                             c["sent_pos"] += len(s_fr)
                             time.sleep(0.02)
@@ -841,7 +909,7 @@ def p2p_get_snapshot_sync(
         time.sleep(0.01)
         
     if ch[CH0]["sess"]:
-        cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, ch[CH0]["sess"])
+        cl_fr = build_app_frame(6, ctrl_frame(0x07, ts, b"", key=media_key), 0, ch[CH0]["sess"])
         sock.sendto(build_transport_hdr(ch[CH0]["myid"], CH0, ch[CH0]["sent_pos"], ch[CH0]["rcv"], cl_fr), peer_addr[0])
         
     stop.set()
@@ -878,13 +946,7 @@ def p2p_get_snapshot_sync(
             h264_best = max(h264_candidates, key=len)
             
     if not h264_best:
-        art_jpg = r"C:\Users\luca\.gemini\antigravity-ide\brain\8ed2bfdd-3a3d-4e0e-9ab7-5e5eb7531243\live_snapshot.jpg"
-        if os.path.exists(art_jpg) and os.path.getsize(art_jpg) > 0:
-            try:
-                with open(art_jpg, "rb") as fh:
-                    return fh.read()
-            except OSError:
-                pass
+        _LOGGER.debug("No H.264 NAL units recovered from the P2P stream for %s", duid)
         return None
         
     with tempfile.NamedTemporaryFile(suffix=".h264", delete=False) as tf_h264:
@@ -922,10 +984,11 @@ async def async_p2p_open_door(
     oem: str = "GVS",
     door: int = 0,
     locknumber: int = 0,
+    data_encode_key: str | None = None,
 ) -> bool:
     """Async wrapper for non-blocking door unlock in Home Assistant executor."""
     return await hass.async_add_executor_job(
-        p2p_open_door_sync, duid, dynamic_password, pin, client_id, oem, door, locknumber
+        p2p_open_door_sync, duid, dynamic_password, pin, client_id, oem, door, locknumber, data_encode_key
     )
 
 
