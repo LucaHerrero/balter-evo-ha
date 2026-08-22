@@ -10,15 +10,19 @@ import logging
 import time
 from typing import Any
 
+import voluptuous as vol
+
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BalterConfigEntry
 from .api import BalterCloudClient
-from .const import DOMAIN
-from .p2p import async_p2p_get_snapshot
+from .const import DOMAIN, OEM_ID, SERVICE_RECORD_CLIP
+from .p2p import async_p2p_get_snapshot, async_p2p_record_clip
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +43,19 @@ async def async_setup_entry(
         entities.append(BalterDoorbellCamera(hass, data.client, device))
 
     async_add_entities(entities)
+
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_RECORD_CLIP,
+        {
+            vol.Required("filename"): cv.string,
+            vol.Optional("seconds", default=5.0): vol.All(
+                vol.Coerce(float), vol.Range(min=1.0, max=30.0)
+            ),
+        },
+        "async_record_clip",
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 class BalterDoorbellCamera(Camera):
@@ -92,19 +109,16 @@ class BalterDoorbellCamera(Camera):
                 return self._last_image
 
             try:
-                dynamic_password = self._device.get("dynamic_password") or ""
-                if not dynamic_password:
-                    try:
-                        dynamic_password = await self._client.get_dynamic_password(self._duid)
-                    except Exception as err:
-                        _LOGGER.debug("Could not refresh dynamic password from cloud: %s", err)
-                        dynamic_password = ""
+                # Beide Geheimnisse rotieren woechentlich -> immer frisch holen.
+                creds = await self._client.get_device_credentials(self._duid)
 
                 image_bytes = await async_p2p_get_snapshot(
                     self.hass,
                     self._duid,
-                    dynamic_password,
-                    data_encode_key=self._device.get("data_encode_key"),
+                    creds.get("dynamic_password") or "",
+                    data_encode_key=creds.get("data_encode_key")
+                    or self._device.get("data_encode_key"),
+                    oem=OEM_ID.replace(",", ""),
                 )
                 if image_bytes:
                     self._last_image = image_bytes
@@ -114,3 +128,41 @@ class BalterDoorbellCamera(Camera):
                 _LOGGER.warning("Could not fetch P2P snapshot for %s: %s", self._duid, err)
 
         return self._last_image
+
+    async def async_record_clip(self, seconds: float, filename: str) -> dict[str, Any]:
+        """Record a short MP4 clip and write it to ``filename``.
+
+        Backs the ``balter_evo.record_clip`` entity service. The door station
+        starts sending video about two seconds after the login, so the recorder
+        captures a longer window and trims the clip to the requested length.
+        """
+        if not self.hass.config.is_allowed_path(filename):
+            raise HomeAssistantError(
+                f"Pfad {filename} ist nicht freigegeben (siehe allowlist_external_dirs)"
+            )
+
+        async with self._lock:
+            creds = await self._client.get_device_credentials(self._duid)
+            clip = await async_p2p_record_clip(
+                self.hass,
+                self._duid,
+                creds.get("dynamic_password") or "",
+                data_encode_key=creds.get("data_encode_key")
+                or self._device.get("data_encode_key"),
+                oem=OEM_ID.replace(",", ""),
+                seconds=seconds,
+            )
+
+        if not clip:
+            raise HomeAssistantError(
+                "Kein Videoclip erhalten -- Handshake gescheitert oder ffmpeg fehlt"
+            )
+
+        def _write() -> None:
+            with open(filename, "wb") as fh:
+                fh.write(clip)
+
+        await self.hass.async_add_executor_job(_write)
+        _LOGGER.info("Balter EVO: wrote %.1fs clip (%d bytes) to %s",
+                     seconds, len(clip), filename)
+        return {"filename": filename, "size": len(clip), "seconds": seconds}

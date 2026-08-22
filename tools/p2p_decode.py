@@ -295,7 +295,7 @@ def build_login_payload(dynamic_password, clientid, oem="G0028G0126"):
 APP_FRAME_CONST_10 = bytes.fromhex("0001000003011200")   # @0x10..0x18, konstant
 
 
-def build_app_frame(outer_msg, body, sess):
+def build_app_frame(outer_msg, body, sess, ch_idx=0):
     """Umhuellt einen (verschluesselten) Steuerframe-Body mit dem aeusseren
     56-B-App-Frame-Kopf. Alle Laengenfelder sind aus body-len ableitbar; nur
     outer_msg und sess sind frei.
@@ -322,6 +322,7 @@ def build_app_frame(outer_msg, body, sess):
     hdr[0x10:0x18] = APP_FRAME_CONST_10
     struct.pack_into("<I", hdr, 0x18, outer_msg)          # sequenzielle msg-id
     struct.pack_into("<I", hdr, 0x24, body_len + 16)      # body+16
+    struct.pack_into("<H", hdr, 0x28, ch_idx)             # 0 = Video/CH0, 1 = Audio/CH1
     hdr[0x2a:0x2d] = sess                                 # Verbindungs-ID
     hdr[0x2d:0x30] = bytes.fromhex("000004")
     struct.pack_into("<I", hdr, 0x30, body_len)           # body-len

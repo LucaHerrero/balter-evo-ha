@@ -20,13 +20,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "download
 from opener9 import natcheck_query, P2PSession
 
 # --- Konfiguration -----------------------------------------------------------
-DEV_SN    = "B980001083"
-OEM       = "GVS"
-CLIENTID  = "616e64726f6964"
-KEY       = b"11111111111111111111111111111111"
-DOOR      = 0
-LOCK      = 0
-PIN_HASH  = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # SHA256 Leer-PIN
+# dynamic_password, data_encode_key und out_auth_code stammen aus der
+# Cloud-Geraeteliste; die ersten beiden rotieren ~woechentlich. Datei
+# (Standard: creds.json neben diesem Skript, sonst $BALTER_CREDS):
+#   {"dynamic_password": "...", "data_encode_key": "...", "out_auth_code": "..."}
+# out_auth_code == SHA256(<Tuer-PIN>) -- beide Quellen sind austauschbar.
+import json
+
+OEM      = "G0028G0126"          # byte-verifiziert aus dem App-LOGIN
+CLIENTID = "e4d73be5e26e9a83"    # dito -- NICHT hex("android")
+DOOR     = 1                     # 1-basiert, wie in der App
+LOCK     = 1
+
+
+def load_creds():
+    path = os.environ.get("BALTER_CREDS") or os.path.join(os.path.dirname(__file__), "creds.json")
+    if not os.path.exists(path):
+        sys.exit(f"[FEHLER] Keine Zugangsdaten: {path} fehlt.\n"
+                 f"         Erwartet JSON mit dynamic_password, data_encode_key,\n"
+                 f"         out_auth_code (frisch aus der Cloud-Geraeteliste).")
+    d = json.load(open(path, encoding="utf-8"))
+    missing = [k for k in ("dynamic_password", "data_encode_key", "out_auth_code") if not d.get(k)]
+    if missing:
+        sys.exit(f"[FEHLER] {path}: fehlende Felder {missing}")
+    return d["dynamic_password"], d["data_encode_key"].encode("ascii"), d["out_auth_code"]
+
+
+DYNPW, KEY, PIN_HASH = load_creds()
 
 CH0 = 0x01000000
 CH1 = 0x02000001
@@ -79,29 +99,42 @@ def ctrl_frame(ftype, ts, payload, msg13=0, b14=0, f15=0, f16=0):
 
 
 def build_app_frame_v10(outer_msg, body, ch_idx, sess_bytes):
+    """56-B-Kopf + Body, byte-genau wie die App (tools/verify_frames.py).
+
+    Die Bodylaenge steht zweimal drin: body+16 @0x24 und roh @0x30. Ein 48-B-Kopf
+    schiebt den Body 8 B nach vorn -- das Geraet ackt transportseitig weiter,
+    verwirft den Frame aber in der App-Schicht."""
     body_len = len(body)
-    hdr = bytearray(48)
+    hdr = bytearray(56)
     hdr[0:4] = b"\xff\xff\xff\xff"
-    struct.pack_into("<I", hdr, 0x04, 48 + body_len)
+    struct.pack_into("<I", hdr, 0x04, 56 + body_len)
     hdr[0x10:0x18] = bytes.fromhex("0001000003011200")
     struct.pack_into("<I", hdr, 0x18, outer_msg)
     struct.pack_into("<I", hdr, 0x24, body_len + 16)
     struct.pack_into("<H", hdr, 0x28, ch_idx)
     hdr[0x2a:0x2d] = sess_bytes
     hdr[0x2d:0x30] = bytes.fromhex("000004")
+    struct.pack_into("<I", hdr, 0x30, body_len)
     return bytes(hdr) + body
+
+
+def build_a9_body(ch_idx):
+    """32-B-Klartext-Setupbody: [0]=0xa9, [9]=Stromtyp (0=Video, 2=Audio)."""
+    b = bytearray(32)
+    b[0] = 0xa9
+    if ch_idx:
+        b[9] = 0x02
+    return bytes(b)
 
 
 def build_hello76(slot_id, ch_idx):
-    hdr = bytearray(48)
+    hdr = bytearray(56)
     hdr[0:4] = b"\xff\xff\xff\xff"
     struct.pack_into("<I", hdr, 0x04, 76)
     hdr[0x10:0x18] = bytes.fromhex("0001000001011200")
-    struct.pack_into("<I", hdr, 0x24, slot_id | 0x04000000)
-    if ch_idx == 0:
-        struct.pack_into("<I", hdr, 0x28, 0x1a)
-    body = b"\x00" * 28
-    return bytes(hdr) + body
+    struct.pack_into("<I", hdr, 0x24, 20 + 16)
+    struct.pack_into("<I", hdr, 0x28, slot_id | 0x04000000)
+    return bytes(hdr) + b"\x00" * 20
 
 
 def build_mtu_probe(session_flag, testid, aval):
@@ -132,11 +165,6 @@ def build_punch(session_flag, rip, rport, cid=2, tid=1):
     b[0x44:0x44 + len(sf)] = sf
     struct.pack_into("<H", b, 0x84, rport)
     return bytes(b)
-
-
-def current_dynpw():
-    m = hashlib.md5((DEV_SN + OEM + time.strftime("%Y%m%d")).encode()).hexdigest()
-    return m[:8]
 
 
 def open_door():
@@ -179,7 +207,7 @@ def open_door():
     }
     
     ts = int(time.time())
-    dynpw = current_dynpw()
+    dynpw = DYNPW
     stop = threading.Event()
     unlocked = [False]
     peer_addr = [relay]
@@ -260,14 +288,15 @@ def open_door():
                 
                 # 1. HELLO76 -> Session-Basis
                 if tot == 76 and c["state"] in ("SENT_HELLO", "INIT"):
-                    sess_base = pay[48 + 26 : 48 + 28]
-                    slot = pay[0x24]
-                    ch[conv]["slot_id"] = slot
+                    # Session-Basis = letzte 2 B des Geraete-HELLO (absolut 74..76);
+                    # das Slot-Byte ist unser eigenes, nicht aus dem Echo gelesen.
+                    sess_base = pay[74:76]
+                    slot = c["slot_id"]
                     sess_bytes = sess_base + bytes([slot])
                     ch[conv]["sess"] = sess_bytes
                     print(f"  [DEVICE-HELLO] Kanal {conv:#x}: Session-Basis = {sess_base.hex()} | Slot = {slot:#02x} | Sess = {sess_bytes.hex()}")
                     ch_idx = 0 if conv == CH0 else 1
-                    a9_frame = build_app_frame_v10(0, b"\xa9" + b"\x00" * 31, ch_idx, sess_bytes)
+                    a9_frame = build_app_frame_v10(0, build_a9_body(ch_idx), ch_idx, sess_bytes)
                     send_frame(conv, a9_frame, new_state="SENT_A9")
                     
                 # 2. a9-Echo (om=0) -> LOGIN
@@ -343,7 +372,7 @@ def open_door():
                     send_frame(conv, build_hello76(c["slot_id"], 0 if conv == CH0 else 1))
                 elif c["state"] == "SENT_A9" and c["sess"] and (now - c["last_tx"] > 0.4):
                     ch_idx = 0 if conv == CH0 else 1
-                    a9_frame = build_app_frame_v10(0, b"\xa9" + b"\x00" * 31, ch_idx, c["sess"])
+                    a9_frame = build_app_frame_v10(0, build_a9_body(ch_idx), ch_idx, c["sess"])
                     send_frame(conv, a9_frame)
                 elif c["state"] == "SENT_LOGIN" and c["sess"] and (now - c["last_tx"] > 0.4):
                     ch_idx = 0 if conv == CH0 else 1

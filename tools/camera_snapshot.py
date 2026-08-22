@@ -12,12 +12,27 @@ import p2p_decode as p2p
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "downloads", "opener-wip"))
 from opener9 import natcheck_query, P2PSession
 
+def _load_creds():
+    """Geraetegeheimnisse aus tools/creds.json bzw. $BALTER_CREDS lesen.
+
+    Sie gehoeren NICHT ins Repo: dynamic_password und data_encode_key rotieren
+    woechentlich und sind geraetespezifisch. Holen mit tools/fetch_creds.py.
+    """
+    import json
+    path = os.environ.get("BALTER_CREDS") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "creds.json")
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"[FEHLER] {path} fehlt -- erst 'python tools/fetch_creds.py' laufen lassen.")
+    return json.load(open(path, encoding="utf-8"))
+
+
 # Konfiguration
 DEV_SN    = "B980001083"
 OEM       = "GVS"
 CLIENTID  = "616e64726f6964"
 KEY_CTRL  = b"11111111111111111111111111111111"
-KEY_MEDIA = b"9oXiLB9KPe162Q28lMSZYUIZ5VK5812o"
+KEY_MEDIA = _load_creds()["data_encode_key"].encode()
 
 CH0 = 0x01000000
 CH1 = 0x02000001

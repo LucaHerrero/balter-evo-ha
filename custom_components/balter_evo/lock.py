@@ -16,7 +16,7 @@ from homeassistant.helpers.event import async_call_later
 
 from . import BalterConfigEntry
 from .api import BalterApiError, BalterCloudClient
-from .const import CONF_DOOR_PIN, DOMAIN, RELOCK_DELAY
+from .const import CONF_DOOR_PIN, DOMAIN, OEM_ID, RELOCK_DELAY
 from .p2p import async_p2p_open_door
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,30 +57,42 @@ class BalterDoorLock(LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Trigger the door-release relay via P2P."""
-        _LOGGER.info("Door unlock requested for %s (%s)", self.name, self._lock["duid"])
+        duid = self._lock["duid"]
+        _LOGGER.info("Door unlock requested for %s (%s)", self.name, duid)
         try:
-            dynamic_password = self._lock.get("dynamic_password") or ""
-            if not dynamic_password:
-                try:
-                    dynamic_password = await self._client.get_dynamic_password(self._lock["duid"])
-                except Exception as err:
-                    _LOGGER.warning("Could not fetch dynamic password from cloud: %s", err)
-                    dynamic_password = ""
-            
-            # Map 1-based subdev indices to 0-based hardware channels
-            door_idx = max(0, int(self._lock.get("door", 1)) - 1)
-            lock_idx = max(0, int(self._lock.get("locknumber", 1)) - 1)
-            
+            # dynamic_password und data_encode_key rotieren woechentlich -- immer
+            # frisch holen (gecacht), nie die Werte vom Setup-Zeitpunkt benutzen.
+            creds = await self._client.get_device_credentials(duid)
+
+            # Ohne konfigurierte PIN den out-auth-code der Geraeteliste nehmen:
+            # verifiziert gilt out_auth_code == SHA256(<Tuer-PIN>), das Geraet
+            # bekommt in beiden Faellen exakt denselben Hash.
+            pin_sha256 = None if self._pin else (creds.get("out_auth_code") or None)
+
+            # The OPENDOOR payload carries the raw 1-based subdev indices, exactly as the
+            # official app sends them (verified against live_real.pcap: door=1, lock=1).
+            door_idx = int(self._lock.get("door", 1))
+            lock_idx = int(self._lock.get("locknumber", 1))
+
             success = await async_p2p_open_door(
                 self.hass,
-                self._lock["duid"],
-                dynamic_password,
+                duid,
+                creds.get("dynamic_password") or "",
                 self._pin,
+                oem=OEM_ID.replace(",", ""),
                 door=door_idx,
                 locknumber=lock_idx,
+                data_encode_key=creds.get("data_encode_key")
+                or self._lock.get("data_encode_key"),
+                pin_sha256=pin_sha256,
             )
             if not success:
-                raise HomeAssistantError("Keine Bestätigung vom Türöffner empfangen")
+                raise HomeAssistantError(
+                    "Der Türöffner hat den Befehl nicht quittiert. Die Tür wurde "
+                    "vermutlich nicht geöffnet."
+                )
+        except HomeAssistantError:
+            raise
         except Exception as err:
             _LOGGER.error("P2P door unlock failed: %s", err)
             raise HomeAssistantError(f"Türöffnen fehlgeschlagen: {err}") from err

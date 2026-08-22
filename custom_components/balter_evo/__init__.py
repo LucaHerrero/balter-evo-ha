@@ -63,7 +63,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bo
                     "duid": device["duid"],
                     "device_name": device["name"],
                     "device_model": device["model"],
+                    # Momentaufnahme fuer den Notfall -- zur Laufzeit holen die
+                    # Entities die rotierenden Geheimnisse frisch ueber
+                    # client.get_device_credentials().
                     "data_encode_key": device.get("data_encode_key"),
+                    "out_auth_code": device.get("out_auth_code"),
                 }
             )
 

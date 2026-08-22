@@ -117,12 +117,24 @@ Der reassemblierte Strom besteht lückenlos aus App-Frames (im Mitschnitt: 820 F
 +18  uint32  seq              Nachrichtenzähler
 +1c  8 B     0
 +24  uint32  bodylen + 16
-+28  uint32  0x04000027       konstant
-+2c  uint32  0xA9190000       konstant
++28  uint16  ch_idx           0 = CH0 (Video/Steuerung), 1 = CH1 (Audio)
++2a  3 B     sess             [2 B Session-Basis vom Gerät][1 B Slot: 07=CH0, 08=CH1]
++2d  3 B     00 00 04         konstant
 +30  uint32  bodylen
 +34  4 B     0
 +38  body                     <- ab hier: erste 64 B verschlüsselt, Rest Klartext
 ```
+
+> **Achtung, häufigste Fehlerquelle:** Der Kopf ist **56 B** und trägt die Bodylänge
+> **zweimal** (`bodylen+16` @0x24 und roh @0x30). Ein 48-B-Kopf (in v10/v11 aller
+> Werkzeuge und der HA-Integration bis 2026-08-21) schiebt den Body 8 B nach vorn.
+> Die Folge ist tückisch: der Transport **ackt** den Frame weiterhin (kumulatives
+> ARQ prüft den Inhalt nicht), die App-Schicht des Geräts verwirft ihn aber still —
+> kein LOGIN, keine Nach-Login-Konfig, kein Video. Siehe §9. Gegenprobe:
+> `tools/verify_frames.py` baut alle 12 Frame-Typen aus `live_real.pcap` nach.
+
+In den Geräte→Client-Frames sind die Blöcke @0x28 und @0x2c **vertauscht**
+(`[Slot-Block][ch_idx][sess-Basis]`).
 
 ### 5a. Krypto: byte9-gesteuerte Teilverschlüsselung — *bestätigt*
 
@@ -245,7 +257,7 @@ Gefunden per Frida-Hook auf `liblive_player.so!SHA256_Final`: Der Digest jedes A
 1. **Adress-Discovery:** Woher bekommt der Client die WAN/LAN-Kandidaten des Geräts und die Rendezvous-Adresse? Vermutlich ein Cloud-Call vor dem Punch – per Frida `SSL_write` beim Verbindungsaufbau mitzuschneiden. **Wichtigster verbleibender Baustein.**
 2. **Prüfsumme (Transport-Feld 6, untere 16 Bit):** Algorithmus unbekannt. Für einen eigenen Client nötig, sofern das Gerät sie prüft. (Kandidat: CRC16 über den 28-B-Header.)
 3. **Sende-Seite:** NAT-Hole-Punch (164-B-INIT parallel an die Kandidaten), Verbindungs-ID-Vergabe, seq/ack-ARQ, Fensterlogik, Retransmit-Timing.
-4. **Stream-Start-Kommando** (optional, für Live-Video in HA): die zwei Vorbereitungs-Frames (`plen=48`, Typ `0xFE`) vor dem Öffnen semantisch zuordnen.
+4. ~~**Stream-Start-Kommando**~~ — **erledigt (2026-08-21, §9):** es gibt keines. Das Gerät sendet Video von selbst, sobald der CH0-LOGIN akzeptiert ist. Die `0xFE`-Frames `msg13=5/6/2` folgen dem Video, sie starten es nicht.
 
 Der **Türöffner** braucht nur 1–3 (kein Video). Die Krypto- und Kommando-Schicht (Frame bauen, verschlüsseln, Trailer) ist fertig und in `tools/p2p_decode.py` implementiert.
 
@@ -390,3 +402,174 @@ zum Standalone-Client verifiziert, und MQTT ist ausgeschlossen. Der fehlende 144
 an der **nativen Zustandsmaschinen-Kadenz** (CQVTimeout-getaktete Stufen, Mutex/Polling-Sende-
 Timing, KCP interval=10ms) — aus Python nicht reproduzierbar. Für die HA-Integration ist der
 Fallback über die native Lib (Frida-Aufruf der opendoor-Funktion) der praktikable Weg.
+
+---
+
+## 9. Die vollständige Live-Sitzung — byte-genau nachgebaut (2026-08-21)
+
+Grundlage: `downloads/live-capture/live_real.pcap` (echte App, Live-Video **und**
+Türöffnen in einer Sitzung), entschlüsselt mit dem `data-encode-key`. Alle unten
+genannten Frames werden von `tools/verify_frames.py` mit den Funktionen der
+HA-Integration nachgebaut und **byte-identisch** gegen den Mitschnitt geprüft
+(12/12; ausgeblendet ist nur uninitialisierter App-Heap @0x08–0x10).
+
+### 9.1 Ablauf (Zeiten aus dem Mitschnitt)
+
+| t [s] | Richtung | Kanal | Frame |
+|-------|----------|-------|-------|
+| 0.008 | → | CH0/CH1 | Transport-SYN, dann BW-Test `0xbb` 520→1420 B (+100 je RTT, Gerät echot jede Stufe) |
+| 0.008 | → | CH0/CH1 | **HELLO76** (76 B, Klasse 1 @0x14, `slot|0x04000000` @0x28) |
+| 0.269 | ← | CH0/CH1 | HELLO76-Echo — die **letzten 2 B (absolut 74..76) sind die Session-Basis** |
+| 0.283 | → | CH0/CH1 | **a9** (88 B, Body 32 B Klartext: `[0]=0xA9`, `[9]`= 0=Video / 2=Audio) |
+| 0.347 | ← | CH0/CH1 | a9-Echo (88 B) |
+| 0.369 | → | CH0 | **LOGIN** `typ=0x01`, `msg13=1`, `f15=f16=1` |
+| 0.390 | → | CH1 | **LOGIN** `typ=0x0B`, `msg13=0xFF`, `b14=0xFF` (gleicher Payload) |
+| 0.521 | → | CH1 | `typ=0x0C` Audioformat (`head[15:17] = 0x1F40` = 8000 Hz) |
+| 0.654 | ← | CH0 | App-ACK (56 B, Body 0, @0x30 = gespiegelte Bodylänge) |
+| **2.686** | ← | CH0 | `0xFE msg13=2`, Payload `00 01` = **Login akzeptiert / Strom bereit** |
+| **2.69+** | ← | CH0 | **Video `typ=0xA0` läuft von selbst los** |
+| 2.878 | → | CH0 | `0xFE msg13=5`, dann `msg13=6`, dann `msg13=2` (je Payload `00`) |
+| 10.6 s | ↔ | CH0/CH1 | Keepalive `typ=0x00`, leer, ~alle 10 s je Kanal, beide Richtungen |
+| 18.1 s | ← | CH0 | `0xFE msg13=8` + 4-B-Zeitstempel (Geräte-Heartbeat) |
+| 37.3 s | → | CH0 | **OPENDOOR** `0xFE msg13=4`, Payload `01 00 01 01` + 12×`00` + 64 Hex-Zeichen |
+| 39.2 s | ← | CH0 | `0xFE msg13=4`, Payload `00 00` = Quittung |
+| 41.7 s | → | CH0/CH1 | `typ=0x07` (Close) |
+
+### 9.2 Es gibt kein Stream-Start-Kommando
+
+Der bisher gesuchte „FastPlay/Play"-Befehl existiert im Upstream **nicht**. Das Gerät
+schickt den Videostrom von selbst, sobald der CH0-LOGIN app-seitig akzeptiert ist —
+im Mitschnitt 2,2 s danach, unmittelbar nach seinem eigenen `0xFE msg13=2`. Die drei
+Client-Frames `msg13=5/6/2` folgen dem Video, sie lösen es nicht aus. Der frühere
+Verdacht „Stufe-2-Trigger hängt an der nativen Timing-Signatur" war falsch: der
+Grund war das um 8 B verschobene Frame-Format (§5).
+
+### 9.3 LOGIN-Payload — exakte Werte
+
+```
+adminapp&&<dynamic_password>\0 G0028G0126 \0 clientid=e4d73be5e26e9a83 \0
+```
+
+- `clientid` ist die **App-Client-ID** (dieselbe wie im Cloud-/MQTT-Login),
+  **nicht** `616e64726f6964` (= hex „android"), wie ältere Nachbauten annahmen.
+- OEM ist `G0028G0126` (ohne Komma), nicht `GVS`.
+- `dynamic_password` (152 Zeichen) und `data_encode_key` (32 Zeichen) rotieren
+  ~wöchentlich und müssen frisch aus der Cloud-Geräteliste kommen.
+
+### 9.4 OPENDOOR-Payload
+
+```
+01 00 01 01 00×12  +  SHA256(<Tür-PIN>) als 64 Hex-Zeichen
+^  ^  ^  ^
+|  |  |  +-- Aktion 1 = entriegeln
+|  |  +----- locknumber (1-basiert)
+|  +-------- 0
++----------- door (1-basiert)
+```
+
+Der Hex-Hash ist identisch mit dem `out-auth-code` der Cloud-Geräteliste
+(verifiziert: `SHA256("<PIN>")` == `out_auth_code`) — beide Quellen sind austauschbar.
+
+### 9.5 Empfangsseite
+
+`extract_app_frames()` + `decrypt_head(frame[56:], key)`. Mit dem alten Offset 48
+gehen **SPS und alle P-Frames verloren** (nur IDR/PPS bleiben lesbar) — gemessen am
+Downstream von `live_real.pcap`: 56 → SPS=19, IDR=19, non-IDR=665; 48 → SPS=0,
+IDR=19, non-IDR=0. Das erklärt die früheren „nur gelegentlich ein Standbild"-Effekte.
+
+---
+
+## 10. Live verifiziert am echten Gerät (2026-08-21)
+
+Der Frameformat-Fix aus §9 ist gegen die reale Türstation bestätigt.
+Der Ablauf läuft erstmals vollständig durch (`tools/live_test.py`):
+
+```
+relay ('141.95.54.10', 56122), device pub=(...:41356) loc=(192.168.178.143:41356)
+transport up (CH0=0x18000010 CH1=0x1700000f) -> HELLO76
+CH1000000 device HELLO, sess=150307 -> a9
+CH1000000 a9 acknowledged           -> LOGIN
+CH1000000 LOGIN accepted                      <-- mit 48-B-Kopf nie erreicht
+video stream is flowing (8244 B on CH0)       <-- ~2 s nach dem LOGIN, ohne Play-Kommando
+```
+
+Ergebnis eines 14-s-Laufs: 750 kB Rohstrom, 311 App-Frames (99,7 % Abdeckung),
+288 Medien-Frames, 352×280, SPS=6 / PPS=7 / IDR=7 / P-Frames=216 — als MP4 und
+JPEG gerendert und visuell geprüft. §9 ist damit nicht nur offline byte-genau,
+sondern auch am Gerät bestätigt.
+
+### 10.1 Jedes Datenpaket muss quittiert werden
+
+Beim ersten erfolgreichen Lauf blieb der Strom nach exakt ~8 kB stehen. Ursache:
+quittiert wurden nur Pakete, die mit dem `ffffffff`-Marker **beginnen**. Ein
+Medien-Frame ist aber bis zu 3,7 kB groß und wird über mehrere UDP-Pakete
+verteilt; die Fortsetzungspakete tragen keinen Marker, advancierten den
+Empfangszeiger nicht und blieben unquittiert → das Sendefenster des Geräts lief
+voll. Der Empfangszeiger muss für **jedes** Datenpaket kumulativ fortgeschrieben
+werden (nur wenn `seq <= rcv`, sonst entsteht eine Lücke, die als empfangen
+gemeldet wird):
+
+```python
+end = seq + payload_len
+if seq <= rcv:
+    rcv = max(rcv, end)
+send_ack()
+```
+
+Wirkung: 5,6 kB → 750 kB in demselben Zeitfenster.
+
+### 10.2 Kandidatenauswahl darf nicht nach Länge gehen
+
+Die Dekodierkette probiert mehrere Schlüssel und zusätzlich den unentschlüsselten
+Rohstrom. Der Rohstrom ist **immer der längste** Kandidat — er trägt alle 56-B-
+Frame-Köpfe und die verschlüsselten 64-B-Blöcke mit und enthält trotzdem
+Start-Codes, scannt also als „H.264". `max(candidates, key=len)` wählte deshalb
+konsequent den unbrauchbaren Kandidaten, obwohl der richtige danebenlag.
+Auswahlkriterium ist jetzt: erster Kandidat, der **SPS und IDR** enthält
+(Kandidaten stehen in Prioritätsreihenfolge, Cloud-Key zuerst).
+
+### 10.3 Wiederverbindungs-Cooldown
+
+Zwei Läufe kurz hintereinander → der zweite bleibt im Handshake stehen (das Gerät
+hält die alte Session, `p2pconnect` liefert kein Relay oder der a9 wird nicht mehr
+quittiert). Zwischen Läufen ~60–90 s Abstand lassen. Ungelöst; für HA relevant,
+wenn Snapshot und Türöffnen kurz nacheinander angefordert werden.
+
+### 10.4 Türöffnen: drei Fehler, die den Befehl wirkungslos machten
+
+Der scharfe Test brauchte vier Anläufe; die ersten drei deckten je einen eigenen
+Fehler auf:
+
+1. **Retransmit am falschen Byte-Offset.** Der ARQ wiederholte HELLO/a9/LOGIN am
+   *aktuellen* `sent_pos` statt am ursprünglichen Offset des Frames. Damit hängte
+   der Client dieselben Bytes als NEUE Daten hinter den Strom; das Gerät sah einen
+   doppelten a9 an falscher Stelle und verwarf die App-Nachricht — der Handshake
+   blieb reproduzierbar bei `SENT_A9` stehen. (Der Snapshot-Pfad hat keinen ARQ und
+   war deshalb nie betroffen — das erklärt, warum Video ging und Türöffnen nicht.)
+   Fix: Sendeoffset beim ersten Senden in `last_pos` merken und dort wiederholen.
+
+2. **OPENDOOR wurde zu früh gesendet.** Als „LOGIN OK" galt jedes Frame mit
+   `om == 1` — das ist aber nur das **Transport-ACK**, das ~150 ms nach dem LOGIN
+   eintrifft. Die App-Session ist erst offen, wenn das Gerät `0xFE msg13=2`
+   (Payload `00 01`) schickt, im Mitschnitt ~2 s später. Vorher angenommene
+   Kommandos verpuffen. Fix: auf `msg13=2` warten, dann Setup `5/6/2` und OPENDOOR.
+
+3. **Kein Retransmit, sofortiges Close.** Der Öffner ging einmal raus, direkt
+   gefolgt vom Close-Frame. Die App sendet ihn bis zu 3× mit fortlaufender
+   outer-msg und schließt erst nach der Quittung. Fix ebenso; der Rückgabewert
+   ist jetzt an die echte Gerätequittung `0xFE msg13=4` gebunden statt an „gesendet".
+
+Erfolgreicher Ablauf (2026-08-22):
+
+```
+CH1000000 got 144B echo, sending LOGIN
+CH1000000 LOGIN acknowledged                  (Transport-ACK)
+device signalled session ready (0xFE msg13=2) (App-Session offen, +2 s)
+OPENDOOR sent (door=1 lock=1)
+device acknowledged OPENDOOR (0xFE msg13=4)
+-> door unlock confirmed by device            (7,5 s gesamt)
+```
+
+Die Quittungserkennung ist offline gegen `live_real.pcap` geprüft: sie findet
+beide echten `msg13=4`-Antworten und erzeugt über die gesamte Sitzung (288
+Medien-Frames) keinen Falschtreffer.

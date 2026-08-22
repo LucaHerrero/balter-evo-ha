@@ -14,6 +14,10 @@ CONF_CLIENT_ID = "client_id"
 # own. We surface it as a lock and optimistically flip back to "locked" after this delay.
 RELOCK_DELAY = 3
 
+# Entity-Service der Kamera: kurzen MP4-Clip aufnehmen und wegschreiben.
+SERVICE_RECORD_CLIP = "record_clip"
+
+
 # Fixed client identity constants captured from the real app's login request.
 # These identify the app/OEM to the backend, not the individual user.
 APP_ID = "4028"
@@ -22,10 +26,17 @@ CLIENT_TYPE = "3"
 CLIENT_VERSION = "v1.13"
 IP_REGION_ID = "1"
 
-# The r1-* nodes are behind a load balancer with a shared session store; a single node
-# handles login + device list + sub-device list + /tdkcgi unlock for one servlet session.
-# We keep one host for the whole session so the jsessionid cookie stays valid.
-HOST = "r1-8.qvcloud.net"
+# Fallback client id when the config entry does not carry one (config_flow always sets one).
+DEFAULT_CLIENT_ID = f"003-{APP_ID}-0123456789abcdef"
+
+# The userapp REST host is not fixed: it is announced per-account by the discovery service
+# (mst/query -> server-type "userapp", e.g. r1-2.qvcloud.net/auth/user). We resolve it at
+# login time (see api.BalterCloudClient._discover_userapp) and only fall back to HOST/BASE_PATH
+# if discovery fails. NOTE: the previously hardcoded r1-8.qvcloud.net/tdk returns HTTP 404.
+DISCOVERY_HOST = "global.qvcloud.net"
+DISCOVERY_PATH = "/mst/query"
+HOST = "r1-2.qvcloud.net"
+BASE_PATH = "/auth/user"
 
 # The real app presents an OkHttp User-Agent; sent for parity (not strictly required).
 USER_AGENT = "okhttp/3.12.1"

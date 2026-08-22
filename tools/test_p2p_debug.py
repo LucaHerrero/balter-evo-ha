@@ -3,7 +3,7 @@ sys.path.insert(0, r'c:\Users\luca\Desktop\Balter - Kopie\custom_components\balt
 import p2p
 
 print("=== Debugging p2p_open_door_sync with MTU probes ===")
-p2p_sess = p2p.CloudP2PSession("e4d73be5e26e9a83", "25023dei8wij")
+p2p_sess = p2p.CloudP2PSession("e4d73be5e26e9a83", os.environ.get("BALTER_DUID", "<duid>"))
 print("1. Connecting MQTT...")
 p2p_sess.connect()
 time.sleep(1.2)

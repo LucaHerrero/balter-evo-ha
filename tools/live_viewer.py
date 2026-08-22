@@ -16,12 +16,34 @@ import p2p_decode as p2p
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "downloads", "opener-wip"))
 from opener9 import natcheck_query, P2PSession
 
-# Geraetedaten & Keys
-DEV_SN    = "B980001083"
-OEM       = "GVS"
-CLIENTID  = "616e64726f6964"
-KEY_CTRL  = b"11111111111111111111111111111111"
-KEY_MEDIA = b"9oXiLB9KPe162Q28lMSZYUIZ5VK5812o"
+# Geraetedaten & Keys.
+#
+# dynamic_password UND data_encode_key rotieren (~woechentlich) und muessen
+# frisch aus der Cloud-Geraeteliste kommen. Datei (Standard: creds.json neben
+# diesem Skript, oder Pfad in $BALTER_CREDS) mit den Feldern der Geraeteliste:
+#   {"dynamic_password": "...", "data_encode_key": "..."}
+# Ctrl-Key == Media-Key == data_encode_key (auf diesem Geraet).
+import json
+
+OEM      = "G0028G0126"          # byte-verifiziert aus dem App-LOGIN
+CLIENTID = "e4d73be5e26e9a83"    # dito -- NICHT hex("android")
+
+
+def load_creds():
+    path = os.environ.get("BALTER_CREDS") or os.path.join(os.path.dirname(__file__), "creds.json")
+    if not os.path.exists(path):
+        sys.exit(f"[FEHLER] Keine Zugangsdaten: {path} fehlt.\n"
+                 f"         Erwartet JSON mit dynamic_password + data_encode_key\n"
+                 f"         (frisch aus der Cloud-Geraeteliste -- beide rotieren).")
+    d = json.load(open(path, encoding="utf-8"))
+    dynpw, key = d.get("dynamic_password"), d.get("data_encode_key")
+    if not dynpw or not key:
+        sys.exit(f"[FEHLER] {path}: dynamic_password/data_encode_key fehlen.")
+    return dynpw, key.encode("ascii")
+
+
+DYNPW, KEY_CTRL = load_creds()
+KEY_MEDIA = KEY_CTRL
 
 CH0 = 0x01000000
 CH1 = 0x02000001
@@ -51,7 +73,7 @@ def th(src_id, dst_id, seq, ack, payload=b"", win=None):
     return bytes(hdr) + payload
 
 
-def ctrl_frame(ftype, ts, payload, msg13=0, b14=0, f15=0, f16=0):
+def ctrl_frame(ftype, ts, payload, msg13=0, b14=0, f15=0, f16=0, b17=0):
     clen = len(payload)
     nutzlen = clen + 32
     plen = nutzlen + ((16 - nutzlen % 16) % 16)
@@ -64,6 +86,8 @@ def ctrl_frame(ftype, ts, payload, msg13=0, b14=0, f15=0, f16=0):
     head[14] = b14
     head[15] = f15
     head[16] = f16
+    if b17:
+        head[17] = b17
     trailer = hashlib.sha256(bytes(head) + bytes(payload)).digest()
     nutz = bytes(payload) + trailer
     if len(nutz) % 16:
@@ -74,29 +98,45 @@ def ctrl_frame(ftype, ts, payload, msg13=0, b14=0, f15=0, f16=0):
 
 
 def build_app_frame(outer_msg, body, ch_idx, sess_bytes):
+    """56-B-Kopf + Body -- byte-genau wie die App (siehe tools/verify_frames.py).
+
+    Der Kopf traegt die Bodylaenge zweimal: als body+16 @0x24 und roh @0x30.
+    Die frueheren 48-B-Koepfe schoben den Body 8 B nach vorn -> das Geraet las
+    Muell als Laenge, ackte transportseitig, verwarf den Frame aber im App-Layer.
+    """
     body_len = len(body)
-    hdr = bytearray(48)
+    hdr = bytearray(56)
     hdr[0:4] = b"\xff\xff\xff\xff"
-    struct.pack_into("<I", hdr, 0x04, 48 + body_len)
+    struct.pack_into("<I", hdr, 0x04, 56 + body_len)
     hdr[0x10:0x18] = bytes.fromhex("0001000003011200")
     struct.pack_into("<I", hdr, 0x18, outer_msg)
     struct.pack_into("<I", hdr, 0x24, body_len + 16)
     struct.pack_into("<H", hdr, 0x28, ch_idx)
     hdr[0x2a:0x2d] = sess_bytes
     hdr[0x2d:0x30] = bytes.fromhex("000004")
+    struct.pack_into("<I", hdr, 0x30, body_len)
     return bytes(hdr) + body
 
 
 def build_hello76(slot_id, ch_idx):
-    hdr = bytearray(48)
+    """76 B = 56-B-Kopf + 20-B-Body. Alles ab 0x2c ist in der App Heap-Muell
+    und wird vom Geraet ignoriert."""
+    hdr = bytearray(56)
     hdr[0:4] = b"\xff\xff\xff\xff"
     struct.pack_into("<I", hdr, 0x04, 76)
     hdr[0x10:0x18] = bytes.fromhex("0001000001011200")
-    struct.pack_into("<I", hdr, 0x24, slot_id | 0x04000000)
-    if ch_idx == 0:
-        struct.pack_into("<I", hdr, 0x28, 0x1a)
-    body = b"\x00" * 28
-    return bytes(hdr) + body
+    struct.pack_into("<I", hdr, 0x24, 20 + 16)
+    struct.pack_into("<I", hdr, 0x28, slot_id | 0x04000000)
+    return bytes(hdr) + b"\x00" * 20
+
+
+def build_a9_body(ch_idx):
+    """32-B-Klartext-Setupbody: [0]=0xa9, [9]=Stromtyp (0=Video, 2=Audio)."""
+    b = bytearray(32)
+    b[0] = 0xa9
+    if ch_idx:
+        b[9] = 0x02
+    return bytes(b)
 
 
 def build_mtu_probe(session_flag, testid, aval):
@@ -127,11 +167,6 @@ def build_punch(session_flag, rip, rport, cid=2, tid=1):
     b[0x44:0x44 + len(sf)] = sf
     struct.pack_into("<H", b, 0x84, rport)
     return bytes(b)
-
-
-def current_dynpw():
-    m = hashlib.md5((DEV_SN + OEM + time.strftime("%Y%m%d")).encode()).hexdigest()
-    return m[:8]
 
 
 def capture_live(duration=6.0):
@@ -174,7 +209,7 @@ def capture_live(duration=6.0):
     }
     
     ts = int(time.time())
-    dynpw = current_dynpw()
+    dynpw = DYNPW
     stop = threading.Event()
     peer_addr = [relay]
     rx_stream_segments = {} # seq -> payload
@@ -259,14 +294,15 @@ def capture_live(duration=6.0):
                 
                 # 1. HELLO76 -> Session-Basis
                 if tot == 76 and c["state"] in ("SENT_HELLO", "INIT"):
-                    sess_base = pay[48 + 26 : 48 + 28]
-                    slot = pay[0x24]
-                    ch[conv]["slot_id"] = slot
+                    # Session-Basis = die letzten 2 B des Geraete-HELLO (absolut 74..76).
+                    # Das Slot-Byte ist unser eigenes (0x07/0x08), nicht aus dem Echo.
+                    sess_base = pay[74:76]
+                    slot = c["slot_id"]
                     sess_bytes = sess_base + bytes([slot])
                     ch[conv]["sess"] = sess_bytes
                     print(f"  [DEVICE-HELLO] Kanal {conv:#x}: Session-Basis = {sess_base.hex()} | Slot = {slot:#02x} | Sess = {sess_bytes.hex()}")
                     ch_idx = 0 if conv == CH0 else 1
-                    a9_frame = build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, sess_bytes)
+                    a9_frame = build_app_frame(0, build_a9_body(ch_idx), ch_idx, sess_bytes)
                     send_frame(conv, a9_frame, new_state="SENT_A9")
                     
                 # 2. a9-Echo (om=0) -> LOGIN
@@ -288,7 +324,12 @@ def capture_live(duration=6.0):
                     print(f"  [LOGIN OK] Kanal {conv:#x} eingeloggt!")
                     if conv == CH0:
                         sess_bytes = ch[CH0]["sess"]
-                        print(f"  [STREAM START] Sende Stream-Startbefehle...")
+                        # Es gibt KEIN Stream-Start-Kommando: das Geraet schickt den
+                        # Videostrom nach akzeptiertem CH0-LOGIN von selbst (in
+                        # live_real.pcap ~2,2 s nach dem LOGIN, direkt nach seinem
+                        # 0xFE msg13=2 mit Payload 00 01). Die App antwortet danach
+                        # nur noch mit msg13=5, 6, 2 -- genau das hier.
+                        print("  [LOGIN OK] Warte auf Geraete-Konfig (0xFE msg13=2)...")
                         for om_num, m in ((2, 5), (3, 6), (4, 2)):
                             s_fr = build_app_frame(om_num, ctrl_frame(0xFE, ts, b"\x00", msg13=m), 0, sess_bytes)
                             send_frame(CH0, s_fr)
@@ -333,11 +374,12 @@ def capture_live(duration=6.0):
                     send_frame(conv, build_hello76(c["slot_id"], 0 if conv == CH0 else 1))
                 elif c["state"] == "SENT_A9" and c["sess"] and (now - c["last_tx"] > 0.4):
                     ch_idx = 0 if conv == CH0 else 1
-                    send_frame(conv, build_app_frame(0, b"\xa9" + b"\x00" * 31, ch_idx, c["sess"]))
+                    send_frame(conv, build_app_frame(0, build_a9_body(ch_idx), ch_idx, c["sess"]))
                 elif c["state"] == "SENT_LOGIN" and c["sess"] and (now - c["last_tx"] > 0.4):
                     ch_idx = 0 if conv == CH0 else 1
                     lp = p2p.build_login_payload(dynpw, CLIENTID, OEM)
-                    lb = ctrl_frame(0x01 if conv == CH0 else 0x0b, ts, lp, msg13=1 if conv == CH0 else 0xff)
+                    lb = (ctrl_frame(0x01, ts, lp, msg13=1, f15=1, f16=1) if conv == CH0
+                          else ctrl_frame(0x0b, ts, lp, msg13=0xff, b14=0xff))
                     send_frame(conv, build_app_frame(1, lb, ch_idx, c["sess"]))
             last_arq = now
         time.sleep(0.01)
@@ -354,7 +396,7 @@ def capture_live(duration=6.0):
         
     # Sende Teardown/Close frame
     if ch[CH0]["sess"]:
-        send_frame(CH0, build_app_frame(6, ctrl_frame(0x07, ts, b""), 0, ch[CH0]["sess"]))
+        send_frame(CH0, build_app_frame(7, ctrl_frame(0x07, ts, b""), 0, ch[CH0]["sess"]))
         
     stop.set()
     sock.close()
@@ -384,7 +426,7 @@ def capture_live(duration=6.0):
         for key in (KEY_MEDIA, KEY_CTRL):
             plain = bytearray()
             for _, f in frames:
-                p = p2p.decrypt_head(f[48:], key)
+                p = p2p.decrypt_head(f[56:], key)
                 plain.extend(p)
             h = p2p.extract_h264(bytes(plain))
             if len(h) > 500: h264_candidates.append(h)
@@ -392,15 +434,25 @@ def capture_live(duration=6.0):
         if len(h_raw) > 500: h264_candidates.append(h_raw)
         
     if not h264_candidates:
-        print("  [INFO] Nutze verifizierten Master-Stream...")
-        dec_h264 = r"c:\Users\luca\Desktop\Balter - Kopie\downloads\p2p-open\decoded\stream.h264"
-        if os.path.exists(dec_h264):
-            h264_best = open(dec_h264, "rb").read()
-        else:
-            return None
-    else:
-        h264_best = max(h264_candidates, key=len)
-        
+        print(f"  [FEHLER] Kein dekodierbares Live-H.264 im Stream "
+              f"({len(rx_stream_segments)} Segmente, {len(raw_stream)} Bytes empfangen).")
+        print("  -> Der Live-Empfang lieferte keine gueltigen Videodaten. Es wird")
+        print("     bewusst KEIN Konserven-Bild mehr geschrieben (frueherer Fallback).")
+        return None
+    # Ersten Kandidaten mit SPS UND IDR nehmen, nicht den laengsten: der
+    # unentschluesselte Rohstrom ist immer am laengsten und trotzdem unbrauchbar.
+    def _decodable(buf):
+        kinds, p = set(), buf.find(b"\x00\x00\x00\x01")
+        while p >= 0:
+            if p + 4 < len(buf):
+                kinds.add(buf[p + 4] & 0x1f)
+            p = buf.find(b"\x00\x00\x00\x01", p + 4)
+        return 7 in kinds and 5 in kinds
+
+    h264_best = next((h for h in h264_candidates if _decodable(h)),
+                     max(h264_candidates, key=len))
+
+
     h264_path = os.path.abspath("live_feed.h264")
     jpg_path  = os.path.abspath("live_snapshot.jpg")
     mp4_path  = os.path.abspath("live_video.mp4")
@@ -414,12 +466,9 @@ def capture_live(duration=6.0):
     # 2. MP4 Video generieren
     subprocess.run(["ffmpeg", "-y", "-f", "h264", "-r", "20", "-i", h264_path, "-c:v", "libx264", "-pix_fmt", "yuv420p", mp4_path], capture_output=True)
     
-    art_dir = r"C:\Users\luca\.gemini\antigravity-ide\brain\8ed2bfdd-3a3d-4e0e-9ab7-5e5eb7531243"
     if os.path.exists(jpg_path) and os.path.getsize(jpg_path) > 0:
-        shutil.copy(jpg_path, os.path.join(art_dir, "live_snapshot.jpg"))
         print(f"\n  >>> [ERFOLG] SNAPSHOT ERZEUGT: {jpg_path} ({os.path.getsize(jpg_path)} Bytes) <<<")
     if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
-        shutil.copy(mp4_path, os.path.join(art_dir, "live_video.mp4"))
         print(f"  >>> [ERFOLG] VIDEO-CLIP ERZEUGT: {mp4_path} ({os.path.getsize(mp4_path)} Bytes) <<<")
         
     return jpg_path, mp4_path

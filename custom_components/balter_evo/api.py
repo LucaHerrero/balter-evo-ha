@@ -15,9 +15,12 @@ from yarl import URL
 
 from .const import (
     APP_ID,
+    BASE_PATH,
     CLIENT_VERSION,
     CONF_CLIENT_ID,
     DEFAULT_CLIENT_ID,
+    DISCOVERY_HOST,
+    DISCOVERY_PATH,
     HOST,
     IP_REGION_ID,
     OEM_ID,
@@ -56,10 +59,15 @@ class BalterCloudClient:
         self._email = email
         self._password = password
         self._client_id = client_id or DEFAULT_CLIENT_ID
-        self._base = URL(base_url or f"https://{HOST}/tdk")
+        # Fallback base; the real userapp endpoint is resolved via discovery at login time.
+        self._base = URL(base_url or f"https://{HOST}{BASE_PATH}")
+        self._base_pinned = base_url is not None
+        self._discovered = False
         self._ssl = ssl
         self._jsessionid: str | None = None
         self._server_session: str | None = None
+        # duid -> (abgerufen_um, {dynamic_password, data_encode_key, out_auth_code})
+        self._cred_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
     @property
     def client_id(self) -> str:
@@ -112,6 +120,49 @@ class BalterCloudClient:
         except ET.ParseError as err:
             raise BalterApiError(f"{context}: XML parse error ({err}): {text[:200]}") from err
 
+    # -------------------------------------------------------------- discovery
+
+    async def _discover_userapp(self) -> None:
+        """Resolve the per-account userapp REST endpoint via the discovery service.
+
+        The userapp host is announced by ``global.qvcloud.net/mst/query`` and is not
+        stable across accounts/time, so we never hardcode it. Falls back silently to
+        the configured ``self._base`` if discovery is unavailable.
+        """
+        if self._discovered or self._base_pinned:
+            return
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?><envelope><header>'
+            "<flag>tdkcloud</flag><command>query-hlrv2</command><seq>1</seq></header>"
+            "<content><server-type>userapp</server-type>"
+            f"<oem>{OEM_ID}</oem><devid></devid><public-ip></public-ip>"
+            f"<client-id>{self._client_id}</client-id><regionid>0</regionid>"
+            f"<version>{CLIENT_VERSION}</version></content></envelope>"
+        )
+        try:
+            async with self._session.get(
+                f"https://{DISCOVERY_HOST}{DISCOVERY_PATH}",
+                data=body.encode("utf-8"),
+                headers={"Host": DISCOVERY_HOST, "Content-Type": "application/xml;charset=utf-8"},
+                ssl=self._ssl,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                text = await resp.text()
+            root = self._safe_parse_xml(text, "discovery")
+            for srv in root.findall(".//server"):
+                if (srv.findtext("server-type") or "") != "userapp":
+                    continue
+                url = (srv.findtext("url") or "").strip()
+                uri = (srv.findtext("uri") or "").strip()
+                if url:
+                    base = URL(url)
+                    self._base = base / uri.lstrip("/") if uri else base
+                    self._discovered = True
+                    _LOGGER.debug("Resolved userapp endpoint: %s", self._base)
+                break
+        except (aiohttp.ClientError, BalterApiError, TimeoutError) as err:
+            _LOGGER.debug("userapp discovery failed, using fallback %s: %s", self._base, err)
+
     # --------------------------------------------------------------- bootstrap
 
     async def _bootstrap_session(self) -> None:
@@ -131,6 +182,7 @@ class BalterCloudClient:
 
     async def login(self) -> None:
         """Authenticate and establish a jsessionid session."""
+        await self._discover_userapp()
         await self._bootstrap_session()
         body = (
             '<?xml version="1.0" encoding="UTF-8"?><envelope>'
@@ -284,6 +336,42 @@ class BalterCloudClient:
         return locks
 
     # --------------------------------------------------------------- helpers
+
+    async def get_device_credentials(
+        self, duid: str, max_age: float = 900.0
+    ) -> dict[str, str]:
+        """Return the rotating per-device secrets, refreshed from the cloud.
+
+        ``dynamic_password`` and ``data_encode_key`` both rotate roughly weekly;
+        a stale pair makes the P2P login fail and the video stream undecodable.
+        Reading them once at setup is therefore not enough. Results are cached
+        for ``max_age`` seconds so a burst of snapshots does not hammer the API.
+
+        Returns ``{"dynamic_password", "data_encode_key", "out_auth_code"}``;
+        values may be empty strings if the cloud is unreachable.
+        """
+        cached = self._cred_cache.get(duid)
+        if cached and (time.time() - cached[0]) < max_age:
+            return cached[1]
+
+        creds = {"dynamic_password": "", "data_encode_key": "", "out_auth_code": ""}
+        try:
+            for device in await self.get_device_list():
+                if device["duid"] == duid:
+                    creds = {
+                        "dynamic_password": device.get("dynamic_password") or "",
+                        "data_encode_key": device.get("data_encode_key") or "",
+                        "out_auth_code": device.get("out_auth_code") or "",
+                    }
+                    break
+        except BalterApiError as err:
+            _LOGGER.warning("Could not refresh device credentials for %s: %s", duid, err)
+            if cached:
+                return cached[1]     # lieber alt als gar nichts
+            return creds
+
+        self._cred_cache[duid] = (time.time(), creds)
+        return creds
 
     async def get_dynamic_password(self, duid: str) -> str:
         """Return a fresh rotating device password for one device."""
