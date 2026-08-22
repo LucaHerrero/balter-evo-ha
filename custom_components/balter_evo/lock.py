@@ -30,7 +30,9 @@ async def async_setup_entry(
     """Create one lock entity per discovered door-release relay."""
     data = entry.runtime_data
     pin = entry.data.get(CONF_DOOR_PIN, "")
-    async_add_entities(BalterDoorLock(data.client, lock, pin) for lock in data.locks)
+    async_add_entities(
+        BalterDoorLock(data.client, lock, pin, data.p2p_client_id) for lock in data.locks
+    )
 
 
 class BalterDoorLock(LockEntity):
@@ -40,10 +42,13 @@ class BalterDoorLock(LockEntity):
     _attr_assumed_state = True
     _attr_icon = "mdi:door"
 
-    def __init__(self, client: BalterCloudClient, lock: dict, pin: str) -> None:
+    def __init__(
+        self, client: BalterCloudClient, lock: dict, pin: str, client_id: str
+    ) -> None:
         self._client = client
         self._lock = lock
         self._pin = pin
+        self._client_id = client_id
         self._attr_is_locked = True
         self._relock_unsub: Any = None
         self._attr_unique_id = f"{lock['duid']}_{lock['code']}"
@@ -79,6 +84,7 @@ class BalterDoorLock(LockEntity):
                 duid,
                 creds.get("dynamic_password") or "",
                 self._pin,
+                client_id=self._client_id,
                 oem=OEM_ID.replace(",", ""),
                 door=door_idx,
                 locknumber=lock_idx,

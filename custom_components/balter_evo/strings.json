@@ -3,20 +3,59 @@
     "step": {
       "user": {
         "title": "Balter EVO / Quvii Cloud",
-        "description": "Login mit deinem Cloud-Account (nicht das lokale Geräte-Passwort) und der Tür-PIN, die du in der Balter-App zum Entriegeln nutzt.",
+        "description": "Login mit deinem Cloud-Account (nicht das lokale Geräte-Passwort). Die Tür-PIN ist optional – ohne Angabe wird der von der Cloud gelieferte Auth-Code verwendet.",
         "data": {
           "email": "E-Mail",
           "password": "Passwort",
-          "door_pin": "Tür-PIN (zum Entriegeln)"
+          "door_pin": "Tür-PIN (optional)",
+          "signalling_id": "Signalisierungs-ID der App (16 Hex-Zeichen, optional)"
+        },
+        "data_description": {
+          "signalling_id": "Nur die P2P-Signalisierung akzeptiert ausschliesslich client-ids, die beim Hersteller-Server registriert sind. Ohne Eintrag nutzt die Integration eine selbst erzeugte ID - Cloud-Login und Geraete-Login funktionieren damit, die Signalisierung aber nicht. Die ID der Balter-App findest du im REPO-README unter \"Signalisierungs-ID\".",
+          "door_pin": "Leer lassen, um den Auth-Code aus der Geräteliste zu verwenden."
         }
       }
     },
     "error": {
       "invalid_auth": "E-Mail oder Passwort falsch",
-      "cannot_connect": "Verbindung zum Quvii-Cloud-Server fehlgeschlagen"
+      "cannot_connect": "Verbindung zum Quvii-Cloud-Server fehlgeschlagen",
+      "invalid_signalling_id": "Die Signalisierungs-ID muss aus genau 16 Hex-Zeichen bestehen (0-9, a-f)"
     },
     "abort": {
       "already_configured": "Dieser Account ist bereits eingerichtet"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Balter EVO – Einstellungen",
+        "data": {
+          "signalling_id": "Signalisierungs-ID der App (16 Hex-Zeichen, optional)",
+          "door_pin": "Tür-PIN (optional)"
+        },
+        "data_description": {
+          "signalling_id": "Nur die P2P-Signalisierung akzeptiert ausschliesslich client-ids, die beim Hersteller-Server registriert sind. Ohne Eintrag nutzt die Integration eine selbst erzeugte ID - Cloud-Login und Geraete-Login funktionieren damit, die Signalisierung aber nicht. Die ID der Balter-App findest du im REPO-README unter \"Signalisierungs-ID\"."
+        }
+      }
+    },
+    "error": {
+      "invalid_signalling_id": "Die Signalisierungs-ID muss aus genau 16 Hex-Zeichen bestehen (0-9, a-f)"
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Videoclip aufnehmen",
+      "description": "Nimmt einen kurzen Clip der Türstation auf und speichert ihn als MP4.",
+      "fields": {
+        "filename": {
+          "name": "Dateiname",
+          "description": "Zielpfad für das MP4, z. B. /media/tuerstation.mp4"
+        },
+        "seconds": {
+          "name": "Länge",
+          "description": "Cliplänge in Sekunden."
+        }
+      }
     }
   }
 }

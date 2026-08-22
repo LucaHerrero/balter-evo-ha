@@ -28,7 +28,7 @@ from opener9 import natcheck_query, P2PSession
 import json
 
 OEM      = "G0028G0126"          # byte-verifiziert aus dem App-LOGIN
-CLIENTID = "e4d73be5e26e9a83"    # dito -- NICHT hex("android")
+CLIENTID = load_creds().get("client_id", "")   # aus creds.json, nicht hartcodiert
 DOOR     = 1                     # 1-basiert, wie in der App
 LOCK     = 1
 

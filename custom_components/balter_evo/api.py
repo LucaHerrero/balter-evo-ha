@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import secrets
 import time
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -18,7 +19,6 @@ from .const import (
     BASE_PATH,
     CLIENT_VERSION,
     CONF_CLIENT_ID,
-    DEFAULT_CLIENT_ID,
     DISCOVERY_HOST,
     DISCOVERY_PATH,
     HOST,
@@ -58,7 +58,9 @@ class BalterCloudClient:
         self._session = session
         self._email = email
         self._password = password
-        self._client_id = client_id or DEFAULT_CLIENT_ID
+        # Ohne uebergebene Identitaet eine eigene erzeugen -- niemals eine
+        # feste, von allen Installationen geteilte ID verwenden.
+        self._client_id = client_id or secrets.token_hex(8)
         # Fallback base; the real userapp endpoint is resolved via discovery at login time.
         self._base = URL(base_url or f"https://{HOST}{BASE_PATH}")
         self._base_pinned = base_url is not None

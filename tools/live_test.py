@@ -129,7 +129,9 @@ def main() -> int:
           f"| client_id {c.get('client_id')} | oem {c.get('oem')}")
     print("=" * 68)
 
-    kwargs = dict(client_id=c.get("client_id") or p2p.DEFAULT_CLIENT_ID,
+    if not c.get("client_id"):
+        sys.exit("[FEHLER] creds.json enthaelt keine client_id -- fetch_creds.py neu laufen lassen.")
+    kwargs = dict(client_id=c["client_id"],
                   oem=c.get("oem") or p2p.DEFAULT_OEM)
 
     if args.open_door:

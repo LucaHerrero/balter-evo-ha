@@ -25,25 +25,27 @@ from opener9 import natcheck_query, P2PSession
 # Ctrl-Key == Media-Key == data_encode_key (auf diesem Geraet).
 import json
 
-OEM      = "G0028G0126"          # byte-verifiziert aus dem App-LOGIN
-CLIENTID = "e4d73be5e26e9a83"    # dito -- NICHT hex("android")
+OEM = "G0028G0126"          # byte-verifiziert aus dem App-LOGIN
 
 
 def load_creds():
+    """creds.json lesen (tools/creds.json oder $BALTER_CREDS)."""
     path = os.environ.get("BALTER_CREDS") or os.path.join(os.path.dirname(__file__), "creds.json")
     if not os.path.exists(path):
         sys.exit(f"[FEHLER] Keine Zugangsdaten: {path} fehlt.\n"
-                 f"         Erwartet JSON mit dynamic_password + data_encode_key\n"
-                 f"         (frisch aus der Cloud-Geraeteliste -- beide rotieren).")
+                 f"         Mit 'python tools/fetch_creds.py' erzeugen.")
     d = json.load(open(path, encoding="utf-8"))
-    dynpw, key = d.get("dynamic_password"), d.get("data_encode_key")
-    if not dynpw or not key:
-        sys.exit(f"[FEHLER] {path}: dynamic_password/data_encode_key fehlen.")
-    return dynpw, key.encode("ascii")
+    missing = [k for k in ("dynamic_password", "data_encode_key", "client_id") if not d.get(k)]
+    if missing:
+        sys.exit(f"[FEHLER] {path}: fehlende Felder {missing}")
+    return d
 
 
-DYNPW, KEY_CTRL = load_creds()
+_CREDS = load_creds()
+DYNPW = _CREDS["dynamic_password"]
+KEY_CTRL = _CREDS["data_encode_key"].encode("ascii")
 KEY_MEDIA = KEY_CTRL
+CLIENTID = _CREDS["client_id"]
 
 CH0 = 0x01000000
 CH1 = 0x02000001

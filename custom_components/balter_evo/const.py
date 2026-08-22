@@ -9,6 +9,12 @@ DOMAIN = "balter_evo"
 
 CONF_DOOR_PIN = "door_pin"
 CONF_CLIENT_ID = "client_id"
+# Die P2P-Signalisierung (MQTT: register + p2pconnect) beantwortet nur client-ids,
+# die beim ust-Server registriert sind. Eine selbst erzeugte ID wird dort
+# stillschweigend ignoriert -- Cloud-Login und der P2P-LOGIN am Geraet akzeptieren
+# dagegen jede 16-stellige Hex-ID (beides live verifiziert). Wer keine eigene
+# registrierte ID hat, traegt hier die client-id der Balter-App ein.
+CONF_SIGNALLING_ID = "signalling_id"
 
 # A door-release relay is momentary: after unlocking it buzzes open and re-locks on its
 # own. We surface it as a lock and optimistically flip back to "locked" after this delay.
@@ -26,8 +32,6 @@ CLIENT_TYPE = "3"
 CLIENT_VERSION = "v1.13"
 IP_REGION_ID = "1"
 
-# Fallback client id when the config entry does not carry one (config_flow always sets one).
-DEFAULT_CLIENT_ID = f"003-{APP_ID}-0123456789abcdef"
 
 # The userapp REST host is not fixed: it is announced per-account by the discovery service
 # (mst/query -> server-type "userapp", e.g. r1-2.qvcloud.net/auth/user). We resolve it at

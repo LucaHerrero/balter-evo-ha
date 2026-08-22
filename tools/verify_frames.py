@@ -91,7 +91,7 @@ chk("HELLO76 CH1", bp2p.build_hello76(0x08,1), (0x08000004,0,76), hello=True)
 sess0=real[(0x07000003,0,88)][0x2a:0x2d]; sess1=real[(0x08000004,0,88)][0x2a:0x2d]
 chk("a9 CH0 (Video)", bp2p.build_app_frame(0,bp2p.build_a9_body(0),0,sess0), (0x07000003,0,88))
 chk("a9 CH1 (Audio)", bp2p.build_app_frame(0,bp2p.build_a9_body(1),1,sess1), (0x08000004,0,88))
-lp=bp2p.build_login_payload(DYNPW)
+lp=bp2p.build_login_payload(DYNPW, _CREDS["client_id"])
 chk("LOGIN CH0 (0x01,m13=1,f15=f16=1)",
     bp2p.build_app_frame(1, bp2p.ctrl_frame(0x01,ts_of((0x07000003,1,328)),lp,key=KEY,msg13=1,f15=1,f16=1),0,sess0),
     (0x07000003,1,328))

@@ -35,9 +35,31 @@ _pkg.__path__ = [PKG_DIR]
 sys.modules["balter_evo"] = _pkg
 api = importlib.import_module("balter_evo.api")
 
-# Die P2P-Schicht meldet sich mit DIESER client-id am Geraet an (byte-verifiziert
-# aus live_real.pcap) -- fuer die Cloud dieselbe verwenden, wie es die App tut.
-P2P_CLIENT_ID = "e4d73be5e26e9a83"
+def resolve_client_id(out_path: str, cli_value: str | None) -> str:
+    """Die 16-Hex-Identitaet bestimmen, mit der wir uns ueberall anmelden.
+
+    Reihenfolge: --client-id, $BALTER_CLIENT_ID, vorhandene creds.json, sonst neu
+    erzeugen. Wichtig: die MQTT-Signalisierung beantwortet nur client-ids, die beim
+    Hersteller-Server registriert sind -- eine frisch erzeugte ID taugt fuer
+    Cloud-Login und Geraete-LOGIN, aber nicht fuer p2pconnect.
+    """
+    for cand in (cli_value, os.environ.get("BALTER_CLIENT_ID")):
+        if cand:
+            return cand.strip().lower()
+    if os.path.exists(out_path):
+        try:
+            old = json.load(open(out_path, encoding="utf-8")).get("client_id")
+            if old:
+                return old.strip().lower()
+        except (ValueError, OSError):
+            pass
+    import secrets
+    new = secrets.token_hex(8)
+    print(f"[WARNUNG] Keine client-id vorhanden -- neu erzeugt: {new}")
+    print("          Damit funktioniert die MQTT-Signalisierung NICHT: der ust-Server")
+    print("          beantwortet nur registrierte client-ids. Die ID der Balter-App")
+    print("          per --client-id uebergeben.")
+    return new
 
 
 def account_from_login_md() -> tuple[str, str] | None:
@@ -52,11 +74,12 @@ def account_from_login_md() -> tuple[str, str] | None:
     return None
 
 
-async def run(email: str, password: str, duid: str | None, out: str) -> int:
+async def run(email: str, password: str, duid: str | None, out: str,
+              client_id: str) -> int:
     import aiohttp
 
     async with aiohttp.ClientSession() as session:
-        client = api.BalterCloudClient(session, email, password, client_id=P2P_CLIENT_ID)
+        client = api.BalterCloudClient(session, email, password, client_id=client_id)
         print(f"[1/3] Login als {email} ...")
         await client.login()
         print(f"      OK (userapp-Endpoint via Discovery aufgeloest)")
@@ -105,7 +128,7 @@ async def run(email: str, password: str, duid: str | None, out: str) -> int:
         payload = {
             "duid": dev["duid"],
             "name": dev["name"],
-            "client_id": P2P_CLIENT_ID,
+            "client_id": client_id,
             "oem": "G0028G0126",
             "dynamic_password": dynpw,
             "data_encode_key": key,
@@ -126,6 +149,7 @@ def main() -> int:
     ap.add_argument("--email")
     ap.add_argument("--password")
     ap.add_argument("--duid", help="Geraet auswaehlen, wenn mehrere am Konto haengen")
+    ap.add_argument("--client-id", help="16-Hex-Identitaet (Standard: aus creds.json)")
     ap.add_argument("-o", "--out", default=os.path.join(HERE, "creds.json"))
     args = ap.parse_args()
 
@@ -138,7 +162,10 @@ def main() -> int:
                      "oder login.md im Projektstamm.")
         email, password = acc
         print(f"(Konto aus login.md)")
-    return asyncio.run(run(email, password, args.duid, args.out))
+    client_id = resolve_client_id(args.out, args.client_id)
+    if not re.fullmatch(r'[0-9a-f]{16}', client_id):
+        ap.error(f'client-id muss 16 Hex-Zeichen haben, ist {client_id!r}')
+    return asyncio.run(run(email, password, args.duid, args.out, client_id))
 
 
 if __name__ == "__main__":

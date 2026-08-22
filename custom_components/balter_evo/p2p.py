@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import shutil
 import socket
@@ -53,9 +54,10 @@ DEFAULT_KEY_MEDIA = b"1" * 32
 
 APP_ID = "4028"
 OEM = "G0028,G0126"
-# Values the real app puts into the P2P LOGIN payload (verified byte-exact
-# against live_real.pcap): "adminapp&&<dynpw>\0G0028G0126\0clientid=<id>\0".
-DEFAULT_CLIENT_ID = "e4d73be5e26e9a83"
+# Der LOGIN-Payload lautet "adminapp&&<dynpw>\0<oem>\0clientid=<id>\0" (byte-genau
+# gegen live_real.pcap verifiziert). Die client-id gehoert NICHT ins Repo: sie ist
+# die Identitaet der jeweiligen Installation, wird von der Integration erzeugt und
+# ist fuer die MQTT-Signalisierung ggf. konfigurierbar (const.CONF_SIGNALLING_ID).
 DEFAULT_OEM = "G0028G0126"
 CRED_KEY = bytes.fromhex("a1c1d4bfe68cfc08a8768552e1114fe546a8768552e1114f3ad5b9ece31b8bd7")
 KCP_PARAM = {
@@ -246,7 +248,7 @@ def build_a9_body(ch_idx: int) -> bytes:
 
 
 def build_login_payload(
-    dynpw: str, client_id: str = DEFAULT_CLIENT_ID, oem: str = DEFAULT_OEM
+    dynpw: str, client_id: str, oem: str = DEFAULT_OEM
 ) -> bytes:
     """Build the payload for the LOGIN (cmd=0x01) frame."""
     return (
@@ -394,7 +396,7 @@ def extract_h264(plain: bytes) -> bytes:
 
 # --- Cloud Discovery & MQTT Session ------------------------------------------
 
-def _mst_query(client_id: str = "e4d73be5e26e9a83") -> tuple[int, str]:
+def _mst_query(client_id: str) -> tuple[int, str]:
     body = (
         '<?xml version="1.0" encoding="UTF-8"?><envelope><header>'
         '<flag>tdkcloud</flag><command>query-hlrv2</command><seq>1</seq></header>'
@@ -451,8 +453,17 @@ class CloudP2PSession:
     """Manages the MQTT connection to the Quvii Cloud for P2P Hole Punching."""
 
     def __init__(self, client_id: str, duid: str) -> None:
-        self.client_id = client_id if len(client_id) == 16 else "e4d73be5e26e9a83"
+        # Die Signalisierungs-ID muss 16 Hex-Zeichen haben UND beim ust-Server
+        # registriert sein. Eine frei erfundene ID wird stillschweigend ignoriert
+        # (kein register-Ack, kein p2pconnect) -- siehe README "Signalisierungs-ID".
+        if not re.fullmatch(r"[0-9a-f]{16}", client_id or ""):
+            raise ValueError(
+                f"Ungueltige P2P-Signalisierungs-ID {client_id!r}: "
+                "erwartet werden 16 Hex-Zeichen."
+            )
+        self.client_id = client_id
         self.duid = duid
+        self.registered = threading.Event()
         self.userid = str(random.randint(10**9, 9 * 10**9))
         self.session_flag = rand_token(43)
         self.requ_id = random.randint(-(2**31), -1)
@@ -550,7 +561,12 @@ class CloudP2PSession:
             p = json.loads(msg.payload.decode("utf-8", "replace"))
         except Exception:
             return
-        if p.get("header", {}).get("command") == "p2pconnect":
+        cmd = p.get("header", {}).get("command")
+        if cmd == "register":
+            # Der ust-Server antwortet nur auf REGISTRIERTE client-ids. Bleibt das
+            # Ack aus, ignoriert er auch das folgende p2pconnect.
+            self.registered.set()
+        if cmd == "p2pconnect":
             c = p.get("content", {})
             loc_ip = c.get("loc-ip", [None])
             if loc_ip and loc_ip[0]:
@@ -573,7 +589,7 @@ def _p2p_open_door_impl(
     duid: str,
     dynamic_password: str,
     pin: str,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     door: int = 0,
     locknumber: int = 0,
@@ -611,7 +627,7 @@ def _p2p_open_door_impl(
     lport = sock.getsockname()[1]
     _LOGGER.warning("Balter EVO: NAT check resolved public address %s:%s (local: %s:%s)", mp_ip, mp_port, lip, lport)
 
-    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
+    p2p_sess = CloudP2PSession(client_id, duid)
     p2p_sess.connect()
     time.sleep(1.2)
     p2p_sess.p2pconnect()
@@ -923,7 +939,7 @@ def _p2p_get_snapshot_impl(
     duid: str,
     dynamic_password: str,
     data_encode_key: str | None = None,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
     return_h264: bool = False,
@@ -948,7 +964,7 @@ def _p2p_get_snapshot_impl(
     lip = sock.getsockname()[0]
     lport = sock.getsockname()[1]
     
-    p2p_sess = CloudP2PSession("e4d73be5e26e9a83", duid)
+    p2p_sess = CloudP2PSession(client_id, duid)
     p2p_sess.connect()
     time.sleep(1.2)
     p2p_sess.p2pconnect()
@@ -1242,7 +1258,7 @@ def p2p_record_clip_sync(
     duid: str,
     dynamic_password: str,
     data_encode_key: str | None = None,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     seconds: float = 5.0,
 ) -> bytes | None:
@@ -1295,7 +1311,7 @@ async def async_p2p_open_door(
     duid: str,
     dynamic_password: str,
     pin: str,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     door: int = 0,
     locknumber: int = 0,
@@ -1336,7 +1352,7 @@ async def async_p2p_get_snapshot(
     duid: str,
     dynamic_password: str,
     data_encode_key: str | None = None,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
     attempts: int = 2,
@@ -1366,7 +1382,7 @@ async def async_p2p_record_clip(
     duid: str,
     dynamic_password: str,
     data_encode_key: str | None = None,
-    client_id: str = DEFAULT_CLIENT_ID,
+    client_id: str = "",
     oem: str = DEFAULT_OEM,
     seconds: float = 5.0,
 ) -> bytes | None:

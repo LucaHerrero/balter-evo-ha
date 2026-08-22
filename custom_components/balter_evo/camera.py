@@ -40,7 +40,9 @@ async def async_setup_entry(
     entities = []
 
     for device in data.devices:
-        entities.append(BalterDoorbellCamera(hass, data.client, device))
+        entities.append(
+            BalterDoorbellCamera(hass, data.client, device, data.p2p_client_id)
+        )
 
     async_add_entities(entities)
 
@@ -71,12 +73,14 @@ class BalterDoorbellCamera(Camera):
         hass: HomeAssistant,
         client: BalterCloudClient,
         device: dict[str, Any],
+        client_id: str,
     ) -> None:
         """Initialize the doorbell camera entity."""
         super().__init__()
         self.hass = hass
         self._client = client
         self._device = device
+        self._client_id = client_id
         self._duid = device["duid"]
         self._attr_unique_id = f"{self._duid}_camera"
         self._attr_name = f"{device.get('name', 'Türstation')} Kamera"
@@ -118,6 +122,7 @@ class BalterDoorbellCamera(Camera):
                     creds.get("dynamic_password") or "",
                     data_encode_key=creds.get("data_encode_key")
                     or self._device.get("data_encode_key"),
+                    client_id=self._client_id,
                     oem=OEM_ID.replace(",", ""),
                 )
                 if image_bytes:
@@ -149,6 +154,7 @@ class BalterDoorbellCamera(Camera):
                 creds.get("dynamic_password") or "",
                 data_encode_key=creds.get("data_encode_key")
                 or self._device.get("data_encode_key"),
+                client_id=self._client_id,
                 oem=OEM_ID.replace(",", ""),
                 seconds=seconds,
             )

@@ -447,11 +447,13 @@ Grund war das um 8 B verschobene Frame-Format (§5).
 ### 9.3 LOGIN-Payload — exakte Werte
 
 ```
-adminapp&&<dynamic_password>\0 G0028G0126 \0 clientid=e4d73be5e26e9a83 \0
+adminapp&&<dynamic_password>\0 G0028G0126 \0 clientid=<16-hex-client-id> \0
 ```
 
-- `clientid` ist die **App-Client-ID** (dieselbe wie im Cloud-/MQTT-Login),
+- `clientid` ist die 16-stellige Hex-Client-ID (dieselbe wie im Cloud-/MQTT-Login),
   **nicht** `616e64726f6964` (= hex „android"), wie ältere Nachbauten annahmen.
+  Das Gerät prüft sie nicht: jede 16-Hex-ID wird akzeptiert (live verifiziert).
+  Nur die MQTT-Signalisierung verlangt eine registrierte ID — siehe §10.5.
 - OEM ist `G0028G0126` (ohne Komma), nicht `GVS`.
 - `dynamic_password` (152 Zeichen) und `data_encode_key` (32 Zeichen) rotieren
   ~wöchentlich und müssen frisch aus der Cloud-Geräteliste kommen.
@@ -573,3 +575,30 @@ device acknowledged OPENDOOR (0xFE msg13=4)
 Die Quittungserkennung ist offline gegen `live_real.pcap` geprüft: sie findet
 beide echten `msg13=4`-Antworten und erzeugt über die gesamte Sitzung (288
 Medien-Frames) keinen Falschtreffer.
+
+### 10.5 Die Client-ID muss beim ust-Server registriert sein
+
+Die Identität ist eine 16-stellige Hex-Zahl (die App: eine pro Installation). Sie
+erscheint an vier Stellen — und wird nur an einer davon geprüft:
+
+| Verwendung | Selbst erzeugte ID? | Messung |
+|---|---|---|
+| Cloud-Login (`userapp`) | ✅ akzeptiert | Login + Geräteliste OK |
+| MQTT-Zugangsdaten (Discovery) | ✅ ausgestellt | username/password unterscheiden sich je ID |
+| MQTT-Signalisierung (`register`/`p2pconnect`) | ❌ **ignoriert** | 9 Versuche / 90 s, keine Antwort |
+| P2P-`LOGIN` am Gerät | ✅ akzeptiert | Video lief, Standbild erhalten |
+
+Der Test war verschränkt (eigene ID / App-ID / eigene ID / App-ID): die App-ID
+antwortete 2/2, die frische 0/2. Es ist also keine Flakiness, sondern eine
+serverseitige Registrierung.
+
+`RequMsgUstRegister::BuildJson` schreibt ausweislich der Disassemblierung **nur den
+Header**, keinen Inhalt — die register-Nachricht ist strukturell identisch mit
+unserer. Der Unterschied liegt allein in der ID. Ein Cloud-Login mit der frischen ID
+(auch Minuten vorher) bindet sie nicht.
+
+**Offen:** wie eine ID erstmalig registriert wird. Die Registrierung passiert
+vermutlich beim allerersten App-Start; im vorhandenen Frida-Mitschnitt fehlt sie,
+weil der Hook zu spät ansetzte. Zum Klären bräuchte es einen Mitschnitt einer
+frischen App-Installation (Daten löschen → Hook vor dem Start → erster Login).
+Bis dahin trägt man die ID der eigenen App als „Signalisierungs-ID" ein.

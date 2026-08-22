@@ -3,20 +3,59 @@
     "step": {
       "user": {
         "title": "Balter EVO / Quvii Cloud",
-        "description": "Sign in with your cloud account (not the local device password) and the door PIN you use in the Balter app to unlock.",
+        "description": "Sign in with your cloud account (not the local device password). The door PIN is optional - without it the auth code from the cloud device list is used.",
         "data": {
-          "email": "Email",
+          "email": "E-mail",
           "password": "Password",
-          "door_pin": "Door PIN (for unlocking)"
+          "door_pin": "Door PIN (optional)",
+          "signalling_id": "App signalling id (16 hex chars, optional)"
+        },
+        "data_description": {
+          "signalling_id": "Only the P2P signalling accepts nothing but client ids registered with the vendor server. Without an entry the integration uses a self-generated id - cloud login and device login work with it, the signalling does not. See \"Signalisierungs-ID\" in the repository README.",
+          "door_pin": "Leave empty to use the auth code from the device list."
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid email or password",
-      "cannot_connect": "Could not connect to the Quvii cloud server"
+      "invalid_auth": "Wrong e-mail or password",
+      "cannot_connect": "Could not reach the Quvii cloud server",
+      "invalid_signalling_id": "The signalling id must be exactly 16 hex characters (0-9, a-f)"
     },
     "abort": {
-      "already_configured": "This account is already configured"
+      "already_configured": "This account is already set up"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Balter EVO settings",
+        "data": {
+          "signalling_id": "App signalling id (16 hex chars, optional)",
+          "door_pin": "Door PIN (optional)"
+        },
+        "data_description": {
+          "signalling_id": "Only the P2P signalling accepts nothing but client ids registered with the vendor server. Without an entry the integration uses a self-generated id - cloud login and device login work with it, the signalling does not. See \"Signalisierungs-ID\" in the repository README."
+        }
+      }
+    },
+    "error": {
+      "invalid_signalling_id": "The signalling id must be exactly 16 hex characters (0-9, a-f)"
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Record clip",
+      "description": "Records a short clip from the door station and saves it as MP4.",
+      "fields": {
+        "filename": {
+          "name": "File name",
+          "description": "Target path for the MP4"
+        },
+        "seconds": {
+          "name": "Length",
+          "description": "Clip length in seconds."
+        }
+      }
     }
   }
 }
