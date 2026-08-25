@@ -1,0 +1,60 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balter EVO / Quvii Cloud",
+        "description": "Melde dich mit deinem Quvii-Cloud-Konto an (E-Mail + Passwort der Balter-/Quvii-App, nicht das lokale Geräte-Passwort). Die Tür-PIN ist optional und nur unter „Konfigurieren“ nötig.",
+        "data": {
+          "email": "E-Mail",
+          "password": "Passwort"
+        },
+        "data_description": {}
+      },
+      "reauth_confirm": {
+        "title": "Balter EVO – erneut anmelden",
+        "description": "Die Balter-Cloud hat die gespeicherten Zugangsdaten für {email} abgelehnt. Bitte das Passwort erneut eingeben.",
+        "data": {
+          "password": "Passwort"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "E-Mail oder Passwort falsch",
+      "cannot_connect": "Verbindung zum Quvii-Cloud-Server fehlgeschlagen"
+    },
+    "abort": {
+      "already_configured": "Dieser Account ist bereits eingerichtet",
+      "reauth_successful": "Die Anmeldedaten wurden aktualisiert",
+      "unique_id_mismatch": "Die Anmeldung gehört zu einem anderen Konto als dem eingerichteten"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Balter EVO – Einstellungen",
+        "data": {
+          "door_pin": "Tür-PIN (optional)"
+        },
+        "data_description": {
+          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst -- eine falsche PIN lehnt die Station stillschweigend ab."
+        }
+      }
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Videoclip aufnehmen",
+      "description": "Nimmt einen kurzen Clip der Türstation auf und speichert ihn als MP4.",
+      "fields": {
+        "filename": {
+          "name": "Dateiname",
+          "description": "Zielpfad für das MP4, z. B. /media/tuerstation.mp4"
+        },
+        "seconds": {
+          "name": "Länge",
+          "description": "Cliplänge in Sekunden."
+        }
+      }
+    }
+  }
+}

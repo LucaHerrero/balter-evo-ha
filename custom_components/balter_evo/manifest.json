@@ -1,0 +1,21 @@
+{
+  "domain": "balter_evo",
+  "name": "Balter EVO (Quvii Cloud)",
+  "codeowners": [
+    "@LucaHerrero"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/LucaHerrero/balter-evo-ha",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/LucaHerrero/balter-evo-ha/issues",
+  "loggers": [
+    "paho"
+  ],
+  "requirements": [
+    "cryptography>=38.0.0",
+    "paho-mqtt>=1.6.0"
+  ],
+  "version": "0.9.4"
+}

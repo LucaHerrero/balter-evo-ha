@@ -1,0 +1,60 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balter EVO / Quvii Cloud",
+        "description": "Sign in with your Quvii cloud account (the app's e-mail + password, not the local device password). The door PIN is optional and only available under Configure.",
+        "data": {
+          "email": "E-mail",
+          "password": "Password"
+        },
+        "data_description": {}
+      },
+      "reauth_confirm": {
+        "title": "Balter EVO – sign in again",
+        "description": "The Balter cloud rejected the stored credentials for {email}. Please enter the password again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Wrong e-mail or password",
+      "cannot_connect": "Could not reach the Quvii cloud server"
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "reauth_successful": "The credentials were updated",
+      "unique_id_mismatch": "Those credentials belong to a different account than the configured one"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Balter EVO settings",
+        "data": {
+          "door_pin": "Door PIN (optional)"
+        },
+        "data_description": {
+          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN -- a wrong PIN is rejected silently by the station."
+        }
+      }
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Record clip",
+      "description": "Records a short clip from the door station and saves it as MP4.",
+      "fields": {
+        "filename": {
+          "name": "File name",
+          "description": "Target path for the MP4"
+        },
+        "seconds": {
+          "name": "Length",
+          "description": "Clip length in seconds."
+        }
+      }
+    }
+  }
+}

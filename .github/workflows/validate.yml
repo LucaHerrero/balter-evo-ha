@@ -1,0 +1,58 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Woechentlich, damit neue Anforderungen von HA/HACS auffallen, bevor ein
+    # Nutzer sie als kaputtes Update zu spueren bekommt.
+    - cron: "0 4 * * 1"
+
+jobs:
+  hassfest:
+    name: Home Assistant (hassfest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  json:
+    name: JSON gut geformt und ohne BOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+
+          failed = False
+          for path in sorted(pathlib.Path(".").rglob("*.json")):
+              if ".git" in path.parts:
+                  continue
+              raw = path.read_bytes()
+              # Ein UTF-8-BOM laesst json.loads mit
+              # "Expecting value: line 1 column 1 (char 0)" scheitern -- genau so
+              # bricht Home Assistant beim Laden der Integration ab.
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  print(f"::error file={path}::Datei beginnt mit einem UTF-8-BOM")
+                  failed = True
+                  continue
+              try:
+                  json.loads(raw.decode("utf-8"))
+              except (UnicodeDecodeError, ValueError) as err:
+                  print(f"::error file={path}::{err}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY

@@ -1,0 +1,31 @@
+record_clip:
+  name: Videoclip aufnehmen
+  description: >-
+    Nimmt einen kurzen Clip der Türstation auf und speichert ihn als MP4.
+    Die Türstation beginnt erst rund zwei Sekunden nach dem Login zu senden;
+    es wird deshalb länger aufgenommen und auf die gewünschte Länge gekürzt.
+    Braucht ffmpeg auf dem Home-Assistant-Host.
+  target:
+    entity:
+      integration: balter_evo
+      domain: camera
+  fields:
+    filename:
+      name: Dateiname
+      description: >-
+        Zielpfad für das MP4. Muss in einem freigegebenen Verzeichnis liegen
+        (allowlist_external_dirs), z. B. /media/tuerstation.mp4
+      required: true
+      example: /media/tuerstation.mp4
+      selector:
+        text:
+    seconds:
+      name: Länge
+      description: Cliplänge in Sekunden.
+      required: false
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 30
+          unit_of_measurement: s

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+tools/creds.json
+creds.json
+*.pcap
+tools/live_snapshot.jpg
+tools/live_feed.h264
+tools/live_video.mp4
+tools/fresh_id_snapshot.jpg
+tools/service_clip.mp4
