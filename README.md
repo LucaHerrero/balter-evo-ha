@@ -1,144 +1,110 @@
 ![Balter Logo](https://github.com/LucaHerrero/balter-evo-ha/blob/main/logo.png?raw=true)
 
-# Balter EVO (Quvii Cloud / P2P) – Home Assistant Integration
+# Balter EVO – Home Assistant Integration
 
-Inoffizielle Home-Assistant-Integration für die **Balter EVO 2** Video-Türsprechanlage (und kompatible Homaxi / Qualvision / Quvii P2P-Systeme).
+Inoffizielle Integration für **Balter-EVO-Video-Türsprechanlagen** (Homaxi / Qualvision / Quvii P2P).
+
+Sie öffnet die Tür, liefert das Kamerabild und einen Livestream — der Öffnen-Befehl geht dabei **direkt** über das native P2P-Protokoll der Anlage an die Türstation, nicht über einen Cloud-Dienst. Das Cloud-Konto wird nur gebraucht, um die Geräte zu finden und die wöchentlich wechselnden Geheimnisse abzuholen.
+
+> ### Getestet an einer **Balter EVO 7 WiFi**
+>
+> Dort läuft die Integration im Alltagsbetrieb: Türöffnen, mehrfaches Öffnen hintereinander, Standbild, Livestream und Clip-Aufnahme.
+>
+> Das Protokoll selbst wurde aus der Android-App **Balter EVO 2** (`de.balter.evo.two` v1.8) reverse-engineert und byte-genau gegen echte Mitschnitte verifiziert. Weitere EVO-Modelle und baugleiche Homaxi- / Qualvision- / Quvii-Anlagen sprechen dasselbe Protokoll und sollten funktionieren — **getestet sind sie nicht**. Rückmeldungen dazu sind willkommen.
 
 ---
 
-### Neu in v0.11.2 — zwei Nachträge aus einem zweiten Durchgang
+## Was du bekommst
 
-- **Lässt sich der Keepalive-Thread ausnahmsweise nicht stoppen, hält er die Sitzung weiter offen** — die Station ist dann also gerade *nicht* frei. Die Integration wartet in diesem Fall jetzt den Erholungsabstand ab, statt sofort eine zweite Verbindung danebenzubauen; genau das verträgt das Gerät nicht.
-- **Die Hintergrund-Auffrischung der Zugangsdaten kann das Türöffnen nicht mehr scheitern lassen.** Seit v0.11.1 wartet das Öffnen kurz auf sie — ein unerwarteter Fehler darin hätte den Befehl mitgerissen, obwohl die gespeicherten Werte völlig ausgereicht hätten.
+| Entität | Was sie tut |
+|---|---|
+| `lock.*` — ein Eintrag je Türöffner-Relais | Öffnet die Tür. Als Erfolg gilt erst die **Empfangsbestätigung der Türstation**, nicht das bloße Absenden. Danach fällt die Anzeige nach 8 s optisch wieder zu (das Relais ist ohnehin ein Taster). |
+| `camera.*` — eine je Türstation | Standbild auf Abruf (60 s zwischengespeichert) und auf Wunsch ein echter Livestream (~11 fps MJPEG). |
+| `balter_evo.record_clip` | Nimmt einen kurzen MP4-Clip der Türstation auf. |
 
-Die Sitzungslogik ist jetzt dauerhaft abgesichert: `tools/verify_sessions.py` prüft sie mit 22 Tests ohne Netz und ohne Türstation — Übernahme, Ablauf, Verdrängung, „genau ein Schliessen", den Prüf-Frame bei Paketverlust und dass ein zweites Öffnen wirklich ein neuer Befehl ist.
+Dazu:
 
-### Neu in v0.11.1 — Robustheit der offen gehaltenen Sitzung
+- **Automatische Geräteerkennung** — alle im Cloud-Konto gebundenen Türstationen und Schlösser, inklusive eines zweiten Schlosses derselben Station.
+- **Keine fest eingebauten Zugangsdaten.** Passwörter, Schlüssel und der Tür-Auth-Code kommen zur Laufzeit aus deinem Konto, die Client-Identität erzeugt die Integration selbst. Kein Telefon, keine App-Registrierung.
+- **Erneute Anmeldung** über den Reauth-Dialog von Home Assistant, falls die Cloud die Zugangsdaten einmal abweist.
 
-Nacharbeiten aus einem Code-Review von v0.10.0/v0.11.0 — kein neues Verhalten, aber deutlich weniger Fälle, in denen die Verbindung unnötig neu aufgebaut wird oder die Türstation belegt bleibt.
+## Voraussetzungen
 
-- **Ein verlorenes UDP-Paket verwirft die Sitzung nicht mehr.** Der Prüf-Frame vor jedem Befehl wird jetzt wiederholt; vorher genügte ein Paketverlust, um eine gesunde Sitzung als tot einzustufen — mit sofortigem Neuaufbau gegen die noch belegte Station und 30 s Strafe für den nächsten Versuch.
-- **Nachlaufzeit bei „Sitzung offen halten = 0".** Das Gerät bekommt wieder die 0,6 s zwischen Quittung und Verbindungsabbau, die es zum Ausführen braucht.
-- **Beim Entladen/Neuladen der Integration** werden offene Sitzungen geschlossen und laufende Cloud-Abfragen abgebrochen. Vorher blieb die Türstation nach jedem Speichern der Optionen bis zu einer Haltedauer lang belegt.
-- **Netzwerkfehler zur Cloud** werden jetzt sauber behandelt statt als Traceback im Log zu landen; die Gerätedaten fallen dabei zuverlässig auf den Zwischenspeicher zurück.
-- **Türöffnen wartet bis zu 1,5 s auf frische Geheimnisse**, statt sofort das gespeicherte Paar zu nehmen. Wichtig in der Woche, in der die Geheimnisse rotieren; hängt die Cloud, geht es wie bisher ohne Verzögerung weiter.
-- Nicht mehr erreichbare Signalisierungs-Server werden aus dem 30-Minuten-Zwischenspeicher entfernt, statt eine halbe Stunde lang jede Verbindung scheitern zu lassen.
+- Home Assistant **2025.2.0** oder neuer
+- ein **Quvii-Cloud-Konto** (dasselbe wie in der Balter-/Quvii-App) mit der gebundenen Türstation
+- **`ffmpeg`** auf dem Home-Assistant-Host — nötig für Standbild, Livestream und Clip. Beim Standard-HA-OS ist es vorhanden. Ohne ffmpeg funktioniert das Türöffnen trotzdem.
 
-### Neu in v0.11.0 — Haltedauer der Sitzung einstellbar
+## Installation
 
-Die in v0.10.0 eingeführte offen gehaltene Sitzung lässt sich jetzt unter **Konfigurieren → „Sitzung offen halten"** einstellen. **Der Standard sinkt von 30 s auf 10 s** — das deckt das Öffnen hintereinander ab, ohne die Türstation länger als nötig für Klingel und Handy-App zu belegen.
+### Über HACS (empfohlen)
 
-- Bereich 0–60 Sekunden. **0 schaltet das Offenhalten ab** (Verhalten wie vor v0.10.0: jedes Öffnen baut die Verbindung komplett neu auf).
-- Gilt für alle P2P-Kommandos, also auch für die Übergabe einer laufenden Kamerasitzung ans Türöffnen.
-- Bestehende Installationen übernehmen automatisch die 10 s; ein Neueinrichten ist nicht nötig.
+1. HACS → ⋮ → **Benutzerdefinierte Repositories**
+2. `https://github.com/LucaHerrero/balter-evo-ha` als Kategorie **Integration** hinzufügen
+3. „Balter EVO" herunterladen
+4. Home Assistant neu starten
 
-### Neu in v0.10.0 — schnelleres Türöffnen, mehrfaches Öffnen hintereinander
+Updates erscheinen danach automatisch in HACS.
 
-Die Türstation bedient nur **eine** P2P-Sitzung und braucht nach deren Ende 60–90 s Erholung. Bisher baute jedes Kommando eine eigene Sitzung auf und riss sie wieder ab: ein Öffnen kostete ~7,7 s, ein zweites kurz danach lief in den Mindestabstand von 30 s und scheiterte als „Station besetzt". Die offizielle App hat das Problem nicht, weil sie gar nicht neu verbindet.
+### Manuell
 
-- **Die Sitzung bleibt nach dem Öffnen stehen** und bedient das nächste Kommando in Millisekunden. Davor geht ein harmloser Setup-Frame raus; erst dessen Quittung beweist, dass das Gerät noch zuhört — der Öffner-Frame taugt dafür nicht, ein zweiter Versuch würde die Tür zweimal öffnen.
-- **Snapshot und Livestream übergeben ihre eingeloggte Sitzung** an ein wartendes Türöffnen, statt sie zu schließen.
-- **Das Öffnen wartet nicht mehr auf die Cloud:** ein gespeichertes Geheimnispaar bis 12 h Alter wird sofort benutzt und im Hintergrund aufgefrischt (sie rotieren wöchentlich).
-- NAT-Check läuft parallel zur Cloud-Signalisierung, die Discovery-Antwort wird 30 min zwischengespeichert, der Erholungsabstand gilt pro Gerät statt pro Prozess.
+`custom_components/balter_evo` aus diesem Repo nach `<config>/custom_components/balter_evo` kopieren und Home Assistant neu starten.
 
-### Neu in v0.9.2 — Türöffnen hat Vorrang vor dem Kamerabild
+## Einrichtung
 
-Die Türstation bedient immer nur **eine** P2P-Sitzung. Der häufigste Ablauf — es klingelt, man schaut das Kamerabild an und öffnet dann — lief damit genau in die Blockade: Der Livestream hielt den Slot bis zu 90 Sekunden, das Türöffnen wartete stumm darauf und scheiterte danach scheinbar grundlos an einer „besetzten" Station.
+**Einstellungen → Geräte & Dienste → Integration hinzufügen → Balter EVO**
 
-- **Ein angefordertes Türöffnen beendet einen laufenden Livestream sofort** und übernimmt den Slot.
-- **Standbild-Cache 15 s → 60 s.** Der alte Wert lag unter dem Slot-Zyklus (30 s Mindestabstand + ~10 s pro Snapshot): Ein offenes Dashboard hielt die Türstation dadurch dauerhaft belegt — auch für die Klingel und die Handy-App.
-- Wer den Slot hält, steht jetzt im Log (`Door unlock` / `Live stream` / `Snapshot`), samt Wartezeit.
+Es werden nur **E-Mail und Passwort deines Quvii-Cloud-Kontos** abgefragt — dieselben wie in der App, *nicht* das lokale Gerätepasswort. Alles Weitere findet die Integration selbst.
 
-### Neu in v0.9.0 — Fehlerbehebungen und Anpassung an die HA-Richtlinien
+## Einstellungen
 
-**Behoben — die Integration funktionierte bisher nur kurz nach der Einrichtung:**
-Die Quvii-Cloud lässt eine Sitzung nur wenige Minuten leben. Lief sie ab, wurde sie nie erneuert; das Gerätepasswort blieb leer, und die Türstation lehnte den P2P-Login stillschweigend ab — in der Oberfläche sah das wie eine besetzte Station aus. Die Sitzung wird jetzt automatisch erneuert.
+**Einstellungen → Geräte & Dienste → Balter EVO → Konfigurieren**
 
-**Behoben — die Tür ging auf, Home Assistant meldete trotzdem einen Fehler:**
-Auf eine App-Quittung für das Türöffnen zu warten war aussichtslos, denn das Gerät sendet keine. Quittiert wird transportseitig. Nebenwirkung des alten Verhaltens: die vermeintlichen Wiederholungen gingen als **neue** Befehle raus — die Tür konnte dreimal öffnen. Und weil die Sitzung bis zum Timeout offen blieb, scheiterte jeder Folgeversuch.
+| Einstellung | Standard | Bedeutung |
+|---|---|---|
+| **Tür-PIN** | leer | Leer lassen ist der Normalfall: dann wird der in der Cloud hinterlegte Öffnungscode der Station verwendet. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst — eine falsche PIN lehnt die Station **stillschweigend** ab (die Integration warnt im Log, wenn sie den Verdacht erkennt). |
+| **Sitzung offen halten** | 10 s | Wie lange die Verbindung zur Türstation nach einem Befehl offen bleibt. In dieser Zeit öffnet ein weiterer Druck sofort. Solange die Verbindung steht, ist die Station für Klingel und Handy-App belegt — also nicht höher setzen als nötig. Bereich 0–60 s; **0 schaltet das Offenhalten ab**. |
 
-Weiter:
+Änderungen greifen sofort, die Integration lädt sich dafür selbst neu.
 
-- **Zweites Schloss** einer Türstation wird jetzt erkannt (die Cloud meldet Codes als `lock_chn1 1`, nicht als `door1-lock1`).
-- **Erneute Anmeldung:** Weist die Cloud die Zugangsdaten ab, bietet Home Assistant jetzt einen Reauth-Dialog an, statt die Integration nur scheitern zu lassen.
-- **Signalisierungs-ID entfernt:** Das Feld war überflüssig — eine selbst erzeugte ID funktioniert durchgängig. Bestehende Einträge werden automatisch bereinigt.
-- **Diagnose:** Eine Tür-PIN, die nicht zum Gerät passt, wird jetzt im Log gemeldet statt still zu scheitern.
-- Log-Ausgaben folgen den HA-Konventionen: der Protokollablauf liegt auf `debug`, `warning`/`error` bleiben echten Problemen vorbehalten.
+## Kamera und Livestream
 
-<details>
-<summary>Ablauf mitlesen (Fehlersuche)</summary>
+Außerhalb eines Streams zeigt die Kamera sparsame Einzel-Standbilder mit 60 s Cache. Das ist Absicht: Jedes Bild belegt kurz die einzige P2P-Sitzung der Anlage.
+
+**Livestream starten:** Live-Ansicht der Kamera öffnen **oder** die Entität einschalten (`camera.turn_on`).
+**Stoppen:** Entität ausschalten (`camera.turn_off`) — sonst endet der Stream nach **90 Sekunden** von selbst und gibt die Station wieder frei.
+
+> Der Stream beginnt rund 8–10 s nach dem Öffnen: erst der P2P-Handshake, dann sendet das Gerät selbst noch etwa zwei Sekunden nichts.
+
+Ein angefordertes **Türöffnen hat immer Vorrang** und beendet einen laufenden Stream sofort — es übernimmt dessen bereits aufgebaute Verbindung sogar direkt, statt sie wegzuwerfen.
+
+## Videoclip aufnehmen
 
 ```yaml
-# configuration.yaml
-logger:
-  default: warning
-  logs:
-    custom_components.balter_evo: debug
+action: balter_evo.record_clip
+target:
+  entity_id: camera.tuerstation_kamera
+data:
+  filename: /media/tuerstation.mp4
+  seconds: 5
 ```
-</details>
 
-### Neu in v0.8.0 — Live-Videostream (Start/Stop)
+Das Zielverzeichnis muss in `allowlist_external_dirs` freigegeben sein.
 
-Die Kamera liefert jetzt einen **echten Live-Stream** (~11 fps MJPEG), nicht nur Standbilder. Der H.264-P2P-Strom wird live über `ffmpeg` transkodiert.
+## Wie das Türöffnen funktioniert
 
-- **Start:** Kamera-Live-Ansicht öffnen **oder** die Entität einschalten (`camera.turn_on`).
-- **Stop:** Entität ausschalten (`camera.turn_off`) — sonst endet der Stream automatisch nach **90 Sekunden** und gibt die P2P-Sitzung wieder frei, damit die Türstation für andere Bewohner/die Klingel frei bleibt.
-- Außerhalb eines Streams zeigt die Kamera weiterhin sparsame Einzel-Standbilder.
+Zwei Eigenschaften der Anlage bestimmen das ganze Verhalten:
 
-> Der Stream startet erst ~8–10 s nach dem Öffnen (P2P-Handshake + das Gerät beginnt erst ~2 s nach dem Login zu senden). `ffmpeg` muss auf dem HA-Host installiert sein.
+**Die Türstation bedient immer nur EINE P2P-Sitzung** — und braucht nach deren Ende 60–90 s Erholung. Ein Versuch, der startet, während sie noch belegt ist, *verlängert* die Belegung. Türöffnen, Standbild und Livestream teilen sich deshalb intern einen Slot mit Mindestabstand, und ein Öffnen verdrängt die anderen beiden.
 
-### Neu in v0.7.1 — zuverlässigerer Verbindungsaufbau
+**Ein Verbindungsaufbau kostet 5–8 Sekunden** (NAT-Check, Cloud-Discovery, MQTT-Signalisierung, UDP-Hole-Punching, Login). Genau deshalb hält die Integration die Sitzung nach einem Befehl offen: Das zweite Öffnen ist dann nur noch ein einzelnes Datenpaket und dauert Millisekunden — so, wie es sich auch in der offiziellen App anfühlt.
 
-Live-Mitschnitte zeigen: Die Türstation bedient immer nur **eine** P2P-Sitzung und braucht danach Erholung. Jeder Versuch, der startet, während sie noch belegt ist, verlängert die Belegung — schnelles, wiederholtes Öffnen senkt die Erfolgsquote also, statt sie zu erhöhen.
+Bevor auf einer offen gehaltenen Sitzung ein Befehl abgeht, wird sie mit einem harmlosen Frame geprüft. Erst wenn dessen Quittung kommt, steht fest, dass die Station noch zuhört. Der Öffner-Frame selbst taugt dafür nicht — ein zweiter Versuch würde die Tür zweimal öffnen.
 
-Darum jetzt:
+Kommt die Verbindung nicht zustande, meldet die Integration das klar und bittet, **etwa 30 s zu warten und dann nur einmal** erneut zu öffnen. Der Befehl ist in diesem Fall nachweislich nie gesendet worden.
 
-- **Ein Klick = genau ein sauberer Verbindungsversuch** (kein internes Hämmern mehr).
-- **Mindestabstand zwischen Sitzungen 20 s → 30 s**, damit sich die Station erholen kann.
-- Klappt der Aufbau nicht, kommt sofort der Hinweis, **~30 s zu warten und dann nur einmal** erneut zu öffnen.
-- Das Öffnen selbst ist zuverlässig, **sobald** die Verbindung steht.
+Details zum Protokoll: [`P2P_PROTOCOL.md`](P2P_PROTOCOL.md), Abschnitte 9 und 10.
 
-### Neu in v0.7.0 — klareres Feedback beim Türöffnen
-
-Das Öffnen wird erst an der **echten Gerätequittung** als Erfolg gewertet.
-
-Für alle, die aus der Ferne öffnen und den Summer nicht hören können, gibt es jetzt eine kurze **Bestätigungs-Benachrichtigung**, und der `lock` bleibt sichtbar länger auf „entsperrt“, bevor er optisch wieder zufällt.
-
-Startet die Türstation die P2P-Sitzung nicht (weil sie noch mit einer vorherigen Sitzung beschäftigt ist), erscheint jetzt ein klarer Hinweis, ~20–30 s zu warten — statt einer generischen Fehlermeldung.
-
-Der Befehl wird in diesem Fall nachweislich **nie** gesendet, ein erneuter Versuch öffnet die Tür also nicht doppelt.
-
----
-
-## ✨ Features
-
-- ✅ **Cloud-Login & automatische Geräteerkennung:** Liest alle gebundenen Türstationen und Schlösser aus dem Quvii-Cloud-Konto aus.
-- ✅ **P2P Türöffner (`lock`):** Öffnet die Tür direkt über das native P2P-UDP/KCP-Protokoll. Als Erfolg gilt erst die **Empfangsbestätigung der Türstation** auf der Transportschicht, nicht das bloße Absenden.
-- ✅ **On-Demand Kamera-Snapshot (`camera`):** Live-Bild aus dem H.264-P2P-Strom; die Session wird sofort wieder freigegeben, damit die Anlage für andere Bewohner frei bleibt.
-- 🎬 **Videoclip-Service:** `balter_evo.record_clip` nimmt einen kurzen MP4-Clip der Türstation auf (benötigt `ffmpeg` auf dem HA-Host).
-- 🔑 **Ermittelt seine Geheimnisse selbst:** Rotierende Passwörter, Verschlüsselungs-Keys und der Tür-Auth-Code kommen zur Laufzeit aus dem Cloud-Konto. Die Client-Identität und der Signalisierungs-Schlüssel werden von der Integration selbst erzeugt bzw. berechnet — keine Registrierung und kein Telefon nötig.
-- ✅ **Keine Hardcoded-Credentials:** Alle Passwörter, Tokens und Keys werden dynamisch bezogen. Ohne konfigurierte PIN wird der `out-auth-code` der Geräteliste verwendet.
-
-### Neu in v0.4.0 — Protokollschicht neu aufgesetzt
-
-Der App-Frame-Kopf ist **56 Byte**, nicht 48. Alle bisherigen Versionen sendeten einen 8 Byte zu kurzen Kopf: Der Transport quittierte weiter, die App-Schicht des Geräts verwarf aber jeden Frame — kein Login, kein Video, kein zuverlässiges Türöffnen.
-
-Alle Frames sind jetzt byte-genau gegen einen echten App-Mitschnitt verifiziert (`tools/verify_frames.py`, 12/12).
-
-Weitere behobene Fehler:
-
-- fehlende Quittung für Fortsetzungspakete (der Videostrom blieb nach ~8 kB stehen)
-- ARQ-Retransmits am falschen Byte-Offset (Handshake blieb hängen)
-- zu früh gesendetes `OPENDOOR` (vor der Freigabe der App-Session)
-- Kandidatenauswahl beim Dekodieren, die nach Länge statt nach Dekodierbarkeit ging
-
-Details: [`P2P_PROTOCOL.md`](P2P_PROTOCOL.md), Abschnitt 9 und 10.
-
-> **Hinweis zum Verhalten:** Die Türstation verträgt keine parallelen oder dicht aufeinanderfolgenden P2P-Sitzungen. Snapshot und Türöffner teilen sich deshalb intern einen Slot mit 30 s Mindestabstand. Ein hängengebliebener Handshake wird automatisch wiederholt — beim Türöffner allerdings **nur**, solange der Befehl nachweislich noch nicht gesendet wurde.
-
----
-
-## 🔑 Geheimnisse & Identität
+## Geheimnisse und Identität
 
 Die Integration ermittelt alles Geheime selbst aus deinem Cloud-Konto — nichts davon steht im Code oder muss eingetippt werden:
 
@@ -150,26 +116,58 @@ Die Integration ermittelt alles Geheime selbst aus deinem Cloud-Konto — nichts
 | MQTT-Zugangsdaten | Discovery-Dienst, pro Client-ID ausgestellt | pro Sitzung |
 | Client-ID | wird bei der Einrichtung **selbst erzeugt** (16 Hex) | — |
 
-Die Tür-PIN ist deshalb **optional**: Ohne Eingabe wird der Auth-Code aus der Geräteliste verwendet.
+Die Integration erzeugt bei der Einrichtung eine eigene 16-stellige Client-ID und leitet den installationsspezifischen Schlüssel für die P2P-Signalisierung selbst ab; die KDF der App wurde vollständig aus der nativen Bibliothek reverse-engineert (`qv_kdf.py`). Damit funktioniert die komplette Kette — Cloud-Login, MQTT-Signalisierung und P2P-Login am Gerät — mit einer frei erzeugten ID. **Kein Telefon, keine App, keine Registrierung.**
 
-### Selbst erzeugte Identität — keine Registrierung nötig
+Weil das Öffnen nicht auf die Cloud warten soll, wird ein gespeichertes Geheimnispaar bis 12 h Alter sofort benutzt; frische Werte werden dabei bis zu 1,5 s abgewartet und sonst im Hintergrund nachgeholt.
 
-Die Integration erzeugt bei der Einrichtung eine eigene 16-stellige Client-ID und leitet den installationsspezifischen Schlüssel für die P2P-Signalisierung **selbst ab**. Die KDF der App wurde vollständig aus der nativen Lib reverse-engineert (`qv_kdf.py`).
+## Fehlersuche
 
-Damit funktioniert die komplette Kette — Cloud-Login, MQTT-Signalisierung und P2P-Login am Gerät — mit einer frei erzeugten ID.
-
-**Kein Telefon, keine App, keine Registrierung.**
-
-Das frühere Feld **Signalisierungs-ID** ist seit v0.9.0 entfernt: Die Annahme, die P2P-Signalisierung akzeptiere nur beim Hersteller registrierte IDs, hat sich im Livebetrieb als falsch erwiesen. Bestehende Einträge werden beim nächsten Start automatisch bereinigt.
-
----
-
-## 🎬 Videoclip aufnehmen
+<details>
+<summary>Ablauf mitlesen</summary>
 
 ```yaml
-action: balter_evo.record_clip
-target:
-  entity_id: camera.tuerstation_kamera
-data:
-  filename: /media/tuerstation.mp4
-  seconds: 5
+# configuration.yaml
+logger:
+  default: warning
+  logs:
+    custom_components.balter_evo: debug
+```
+</details>
+
+| Symptom | Wahrscheinliche Ursache |
+|---|---|
+| „Die Türstation ist gerade noch beschäftigt" | Eine vorherige Sitzung läuft noch — Klingel, Handy-App oder ein eigener Stream. Einmal warten, dann **einmal** erneut öffnen. |
+| Tür geht auf, HA meldet trotzdem einen Fehler | Sollte seit v0.9.0 nicht mehr vorkommen. Mit Debug-Log melden. |
+| Öffnen wird angenommen, aber nichts passiert | Meist eine eingetragene Tür-PIN, die nicht zum Gerät passt. Feld leer lassen. Das Log warnt in diesem Fall. |
+| Kein Kamerabild, Türöffnen geht | `ffmpeg` fehlt auf dem HA-Host. |
+
+## Entwicklung
+
+Zwei Regressionstests laufen ohne Türstation und ohne Home Assistant:
+
+```bash
+python tools/verify_frames.py     # Frame-Format byte-genau gegen einen Mitschnitt (braucht den pcap)
+python tools/verify_sessions.py   # Slot-, Sitzungs- und Öffnen-Logik (22 Prüfungen, ohne Netz)
+```
+
+`tools/verify_sessions.py` deckt genau die Fälle ab, die sich an echter Hardware kaum provozieren lassen: Übernahme und Ablauf einer offen gehaltenen Sitzung, „genau ein Schliessen" auf jedem Abbauweg, ein verlorenes Prüf-Paket, ein hängender Keepalive-Thread — und dass ein zweites Öffnen wirklich ein neuer Befehl auf einem neuen Byte-Offset ist.
+
+## Versionsgeschichte
+
+Die vollständigen Notizen stehen unter [Releases](https://github.com/LucaHerrero/balter-evo-ha/releases).
+
+| Version | Kurz |
+|---|---|
+| **0.11.x** | Haltedauer der Sitzung einstellbar (Standard 10 s, 0 = aus); Robustheit: verlorene Pakete verwerfen die Sitzung nicht mehr, sauberes Aufräumen beim Entladen, Netzfehler zur Cloud werden abgefangen. |
+| **0.10.0** | Sitzung bleibt nach dem Öffnen stehen → **mehrfaches Öffnen hintereinander**, erstes Öffnen deutlich schneller. Kamerasitzungen werden ans Türöffnen weitergereicht. |
+| **0.9.2** | Türöffnen hat Vorrang vor dem Kamerabild; Standbild-Cache auf 60 s. |
+| **0.9.0** | Cloud-Sitzung wird erneuert (die Integration funktionierte vorher nur kurz nach der Einrichtung); Türöffnen wird transportseitig quittiert statt auf eine nie kommende App-Antwort zu warten; zweites Schloss erkannt; Reauth-Dialog. |
+| **0.8.0** | Live-Videostream (MJPEG über ffmpeg). |
+| **0.7.x** | Ein Klick = ein sauberer Verbindungsversuch; klareres Feedback und Bestätigungs-Benachrichtigung beim Öffnen. |
+| **0.4.0** | Protokollschicht neu aufgesetzt: App-Frame-Kopf ist 56 Byte, nicht 48 — davor gab es weder Login noch Video noch zuverlässiges Öffnen. |
+
+## Rechtliches
+
+Inoffizielles Projekt, nicht von Balter, Homaxi, Qualvision oder Quvii unterstützt oder geprüft. Das Protokoll wurde durch Analyse der eigenen App und des eigenen Geräts erschlossen. Nutzung auf eigene Verantwortung.
+
+Lizenz: siehe [LICENSE](LICENSE).
