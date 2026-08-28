@@ -6,6 +6,23 @@ Inoffizielle Home-Assistant-Integration für die **Balter EVO 2** Video-Türspre
 
 ---
 
+### Neu in v0.11.0 — Haltedauer der Sitzung einstellbar
+
+Die in v0.10.0 eingeführte offen gehaltene Sitzung lässt sich jetzt unter **Konfigurieren → „Sitzung offen halten"** einstellen. **Der Standard sinkt von 30 s auf 10 s** — das deckt das Öffnen hintereinander ab, ohne die Türstation länger als nötig für Klingel und Handy-App zu belegen.
+
+- Bereich 0–60 Sekunden. **0 schaltet das Offenhalten ab** (Verhalten wie vor v0.10.0: jedes Öffnen baut die Verbindung komplett neu auf).
+- Gilt für alle P2P-Kommandos, also auch für die Übergabe einer laufenden Kamerasitzung ans Türöffnen.
+- Bestehende Installationen übernehmen automatisch die 10 s; ein Neueinrichten ist nicht nötig.
+
+### Neu in v0.10.0 — schnelleres Türöffnen, mehrfaches Öffnen hintereinander
+
+Die Türstation bedient nur **eine** P2P-Sitzung und braucht nach deren Ende 60–90 s Erholung. Bisher baute jedes Kommando eine eigene Sitzung auf und riss sie wieder ab: ein Öffnen kostete ~7,7 s, ein zweites kurz danach lief in den Mindestabstand von 30 s und scheiterte als „Station besetzt". Die offizielle App hat das Problem nicht, weil sie gar nicht neu verbindet.
+
+- **Die Sitzung bleibt nach dem Öffnen stehen** und bedient das nächste Kommando in Millisekunden. Davor geht ein harmloser Setup-Frame raus; erst dessen Quittung beweist, dass das Gerät noch zuhört — der Öffner-Frame taugt dafür nicht, ein zweiter Versuch würde die Tür zweimal öffnen.
+- **Snapshot und Livestream übergeben ihre eingeloggte Sitzung** an ein wartendes Türöffnen, statt sie zu schließen.
+- **Das Öffnen wartet nicht mehr auf die Cloud:** ein gespeichertes Geheimnispaar bis 12 h Alter wird sofort benutzt und im Hintergrund aufgefrischt (sie rotieren wöchentlich).
+- NAT-Check läuft parallel zur Cloud-Signalisierung, die Discovery-Antwort wird 30 min zwischengespeichert, der Erholungsabstand gilt pro Gerät statt pro Prozess.
+
 ### Neu in v0.9.2 — Türöffnen hat Vorrang vor dem Kamerabild
 
 Die Türstation bedient immer nur **eine** P2P-Sitzung. Der häufigste Ablauf — es klingelt, man schaut das Kamerabild an und öffnet dann — lief damit genau in die Blockade: Der Livestream hielt den Slot bis zu 90 Sekunden, das Türöffnen wartete stumm darauf und scheiterte danach scheinbar grundlos an einer „besetzten" Station.

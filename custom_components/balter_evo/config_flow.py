@@ -11,10 +11,17 @@ from homeassistant import config_entries
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import callback
-from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers import aiohttp_client, selector
 
 from .api import BalterApiError, BalterAuthError, BalterCloudClient
-from .const import CONF_CLIENT_ID, CONF_DOOR_PIN, DOMAIN
+from .const import (
+    CONF_CLIENT_ID,
+    CONF_DOOR_PIN,
+    CONF_WARM_IDLE,
+    DEFAULT_WARM_IDLE,
+    DOMAIN,
+    WARM_IDLE_MAX,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,18 +131,24 @@ class BalterEvoConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class BalterEvoOptionsFlow(config_entries.OptionsFlow):
-    """Allow changing the door PIN after setup."""
+    """Allow changing the door PIN and the session hold time after setup."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the door PIN."""
+        """Manage the door PIN and how long a P2P session is kept open."""
         entry = self.config_entry
 
         if user_input is not None:
             self.hass.config_entries.async_update_entry(
                 entry,
-                data={**entry.data, CONF_DOOR_PIN: user_input.get(CONF_DOOR_PIN, "")},
+                data={
+                    **entry.data,
+                    CONF_DOOR_PIN: user_input.get(CONF_DOOR_PIN, ""),
+                    CONF_WARM_IDLE: float(
+                        user_input.get(CONF_WARM_IDLE, DEFAULT_WARM_IDLE)
+                    ),
+                },
             )
             return self.async_create_entry(title="", data={})
 
@@ -144,6 +157,18 @@ class BalterEvoOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_DOOR_PIN, default=entry.data.get(CONF_DOOR_PIN, "")
                 ): str,
+                vol.Optional(
+                    CONF_WARM_IDLE,
+                    default=entry.data.get(CONF_WARM_IDLE, DEFAULT_WARM_IDLE),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0,
+                        max=WARM_IDLE_MAX,
+                        step=1,
+                        unit_of_measurement="s",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

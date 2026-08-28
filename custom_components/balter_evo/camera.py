@@ -46,7 +46,7 @@ async def async_setup_entry(
     """Set up Balter EVO camera entities."""
     data = entry.runtime_data
     async_add_entities(
-        BalterDoorbellCamera(data.client, device, data.p2p_client_id)
+        BalterDoorbellCamera(data.client, device, data.p2p_client_id, data.warm_idle)
         for device in data.devices
     )
 
@@ -80,12 +80,14 @@ class BalterDoorbellCamera(Camera):
         client: BalterCloudClient,
         device: dict[str, Any],
         client_id: str,
+        warm_idle: float,
     ) -> None:
         """Initialize the doorbell camera entity."""
         super().__init__()
         self._client = client
         self._device = device
         self._client_id = client_id
+        self._warm_idle = warm_idle
         self._duid = device["duid"]
         self._attr_unique_id = f"{self._duid}_camera"
         self._attr_name = f"{device.get('name', 'Türstation')} Kamera"
@@ -153,6 +155,7 @@ class BalterDoorbellCamera(Camera):
                 duration=STREAM_DURATION,
                 on_jpeg=self._on_jpeg,
                 should_stop=lambda: self._stop_stream,
+                warm_idle=self._warm_idle,
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Live stream for %s failed: %s", self._duid, err)
@@ -202,6 +205,7 @@ class BalterDoorbellCamera(Camera):
                     or self._device.get("data_encode_key"),
                     client_id=self._client_id,
                     oem=OEM_ID_COMPACT,
+                    warm_idle=self._warm_idle,
                 )
                 if image_bytes:
                     self._last_image = image_bytes
@@ -252,6 +256,7 @@ class BalterDoorbellCamera(Camera):
                 client_id=self._client_id,
                 oem=OEM_ID_COMPACT,
                 seconds=seconds,
+                warm_idle=self._warm_idle,
             )
 
         if not clip:

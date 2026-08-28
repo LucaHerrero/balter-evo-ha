@@ -33,10 +33,12 @@
       "init": {
         "title": "Balter EVO settings",
         "data": {
-          "door_pin": "Door PIN (optional)"
+          "door_pin": "Door PIN (optional)",
+          "warm_idle": "Keep session open"
         },
         "data_description": {
-          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN -- a wrong PIN is rejected silently by the station."
+          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN -- a wrong PIN is rejected silently by the station.",
+          "warm_idle": "How long the connection to the door station stays open after a command. Within that window another press unlocks instantly instead of paying for the full handshake (5-8 s) plus the station's recovery pause. While the connection stands, the station is busy for the doorbell and the phone app -- so do not set this higher than needed. 0 disables keeping it open."
         }
       }
     }

@@ -33,10 +33,12 @@
       "init": {
         "title": "Balter EVO – Einstellungen",
         "data": {
-          "door_pin": "Tür-PIN (optional)"
+          "door_pin": "Tür-PIN (optional)",
+          "warm_idle": "Sitzung offen halten"
         },
         "data_description": {
-          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst -- eine falsche PIN lehnt die Station stillschweigend ab."
+          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst -- eine falsche PIN lehnt die Station stillschweigend ab.",
+          "warm_idle": "Wie lange die Verbindung zur Türstation nach einem Befehl offen bleibt. In dieser Zeit öffnet ein weiterer Druck sofort, statt den kompletten Verbindungsaufbau (5–8 s) und die Erholungspause der Station zu bezahlen. Solange die Verbindung steht, ist die Station für Klingel und Handy-App belegt — darum nicht höher setzen als nötig. 0 schaltet das Offenhalten ab."
         }
       }
     }

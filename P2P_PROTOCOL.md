@@ -543,14 +543,16 @@ Türöffner erst bei t=37,3 s gedrückt wird. Ein zweiter Druck wäre ein weiter
 MQTT, ohne Punch, ohne LOGIN, ohne Cooldown.
 
 Die Integration macht es seit 2026-08-28 genauso: Nach einem quittierten Öffnen
-bleibt die Sitzung `P2P_WARM_IDLE` Sekunden stehen (Keepalive-Thread, der nur
-`maintain()` weiterlaufen lässt) und bedient das nächste Kommando sofort. Vor
+bleibt die Sitzung stehen (Keepalive-Thread, der nur `maintain()` weiterlaufen
+lässt) und bedient das nächste Kommando sofort. Wie lange, ist in den Optionen
+einstellbar (`warm_idle`, Standard 10 s, 0 schaltet ab) — es ist eine reine
+Abwägung zwischen „zweites Öffnen sofort" und „Station schnell wieder frei". Vor
 jedem Kommando auf einer solchen Sitzung geht ein harmloser Setup-Frame
 (`0xFE msg13=2`) raus; erst wenn dessen Transport-Quittung kommt, ist bewiesen,
 dass das Gerät noch zuhört. Der Öffner-Frame selbst taugt dafür nicht — ein
 zweiter Versuch würde die Tür zweimal öffnen. Läuft die Zeit ab, wird sauber
 geschlossen und der Cooldown gilt wieder; Klingel und App bekommen den einzigen
-Slot der Station also nach spätestens `P2P_WARM_IDLE` zurück.
+Slot der Station also nach spätestens der eingestellten Haltedauer zurück.
 
 Aus demselben Grund reicht ein laufender Snapshot oder Livestream seine bereits
 eingeloggte Sitzung an ein wartendes Türöffnen weiter, statt sie zu schließen:

@@ -49,8 +49,8 @@ from .const import (
     CLIENT_TYPE,
     OEM_ID,
     OEM_ID_COMPACT,
+    DEFAULT_WARM_IDLE,
     P2P_MIN_GAP,
-    P2P_WARM_IDLE,
 )
 from .qv_kdf import decode_cred
 
@@ -177,13 +177,15 @@ class _WarmSession:
     Sekunden aus -- mit ihm bedient sie das naechste Kommando in Millisekunden.
     """
 
-    def __init__(self, duid: str, transport: _P2PTransport, signature: _Signature) -> None:
-        """Start keeping ``transport`` alive for at most ``P2P_WARM_IDLE`` seconds."""
+    def __init__(
+        self, duid: str, transport: _P2PTransport, signature: _Signature, idle: float
+    ) -> None:
+        """Start keeping ``transport`` alive for at most ``idle`` seconds."""
         self.duid = duid
         self.transport = transport
         self.signature = signature
         self._stop = threading.Event()
-        self._expiry = time.monotonic() + P2P_WARM_IDLE
+        self._expiry = time.monotonic() + idle
         self._thread = threading.Thread(
             target=self._run, name=f"balter-p2p-warm-{duid}", daemon=True
         )
@@ -244,15 +246,17 @@ def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport 
     return wanted.take() if wanted is not None else None
 
 
-def _store_warm(duid: str, transport: _P2PTransport, signature: _Signature | None) -> None:
+def _store_warm(
+    duid: str, transport: _P2PTransport, signature: _Signature | None, idle: float
+) -> None:
     """Keep ``transport`` open so the next command needs no handshake at all."""
-    if signature is None:
+    if signature is None or idle <= 0:
         transport.close()
         _mark_session_end(duid)
         return
     with _WARM_LOCK:
-        _WARM[duid] = _WarmSession(duid, transport, signature)
-    _LOGGER.debug("Keeping the P2P session with %s warm for %.0fs", duid, P2P_WARM_IDLE)
+        _WARM[duid] = _WarmSession(duid, transport, signature, idle)
+    _LOGGER.debug("Keeping the P2P session with %s warm for %.0fs", duid, idle)
 
 
 class _P2PSlot:
@@ -260,7 +264,8 @@ class _P2PSlot:
 
     Der Slot besitzt die Sitzung: er reicht eine noch offene Sitzung des
     vorherigen Kommandos herein (``transport``) und nimmt sie am Ende wieder
-    entgegen -- um sie warm zu halten (``keep_warm``) oder zu schliessen.
+    entgegen -- um sie ``warm_idle`` Sekunden offen zu halten (``keep_warm``)
+    oder zu schliessen. ``warm_idle=0`` schaltet das Offenhalten ab.
     """
 
     def __init__(
@@ -269,12 +274,14 @@ class _P2PSlot:
         duid: str,
         signature: _Signature | None = None,
         reuse: bool = False,
+        warm_idle: float = DEFAULT_WARM_IDLE,
     ) -> None:
         """Name the kind of session, so the log says who is holding the slot."""
         self._purpose = purpose
         self._duid = duid
         self._signature = signature
         self._reuse = reuse
+        self._warm_idle = warm_idle
         self.transport: _P2PTransport | None = None
         self.keep_warm = False
 
@@ -306,6 +313,11 @@ class _P2PSlot:
             time.sleep(wait)
         return self
 
+    @property
+    def warm_idle(self) -> float:
+        """Return how long a session may be kept open after the command."""
+        return self._warm_idle
+
     def drop_transport(self) -> None:
         """Close the session held here -- it turned out to be unusable."""
         transport = self.transport
@@ -319,7 +331,7 @@ class _P2PSlot:
         transport = self.transport
         self.transport = None
         if transport is not None and self.keep_warm and exc[0] is None:
-            _store_warm(self._duid, transport, self._signature)
+            _store_warm(self._duid, transport, self._signature, self._warm_idle)
         else:
             if transport is not None:
                 transport.close()
@@ -1808,6 +1820,7 @@ def _record_clip(
     client_id: str = "",
     oem: str = DEFAULT_OEM,
     seconds: float = 5.0,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bytes | None:
     """Record a short MP4 clip.
 
@@ -1820,6 +1833,7 @@ def _record_clip(
     h264 = p2p_get_snapshot_sync(
         duid, dynamic_password, data_encode_key=data_encode_key,
         client_id=client_id, oem=oem, duration=window, return_h264=True,
+        warm_idle=warm_idle,
     )
     if not h264:
         return None
@@ -1963,7 +1977,7 @@ def _release_or_hand_over(slot: _P2PSlot, transport: _P2PTransport, what: str) -
     # Der Assembler dieses Kommandos wird gleich nicht mehr gelesen -- ohne dies
     # wuerde die uebergebene Sitzung weiter Video hineinpuffern.
     transport.set_media_sink(None)
-    if _UNLOCK_WANTED.is_set() and transport.device_ready.is_set():
+    if slot.warm_idle > 0 and _UNLOCK_WANTED.is_set() and transport.device_ready.is_set():
         _LOGGER.info("Handing the open P2P session over from the %s to the door unlock", what)
         slot.keep_warm = True
         return
@@ -2094,6 +2108,7 @@ def p2p_open_door_sync(
     locknumber: int = 0,
     data_encode_key: str | None = None,
     pin_sha256: str | None = None,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> UnlockResult:
     """Tueroeffnen -- serialisiert gegen jede andere P2P-Sitzung dieses Prozesses.
 
@@ -2107,7 +2122,8 @@ def p2p_open_door_sync(
     key = _session_key(data_encode_key)
     try:
         with _P2PSlot(
-            "Door unlock", duid, (dynamic_password, client_id, oem, key), reuse=True
+            "Door unlock", duid, (dynamic_password, client_id, oem, key),
+            reuse=True, warm_idle=warm_idle,
         ) as slot:
             return _open_door(
                 slot, duid, dynamic_password, pin, client_id, oem, door, locknumber,
@@ -2125,11 +2141,13 @@ def p2p_get_snapshot_sync(
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
     return_h264: bool = False,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bytes | None:
     """Standbild/Video holen -- serialisiert gegen jede andere P2P-Sitzung."""
     key = _session_key(data_encode_key)
     with _P2PSlot(
-        "Snapshot", duid, (dynamic_password, client_id, oem, key), reuse=True
+        "Snapshot", duid, (dynamic_password, client_id, oem, key),
+        reuse=True, warm_idle=warm_idle,
     ) as slot:
         return _grab_video(
             slot, duid, dynamic_password, key, client_id, oem, duration, return_h264
@@ -2150,14 +2168,17 @@ def p2p_stream_video_sync(
     duration: float = 90.0,
     on_jpeg: Callable[[bytes], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> int:
     """Live-Videostream -- serialisiert gegen jede andere P2P-Sitzung."""
     key = _session_key(data_encode_key)
     with _P2PSlot(
-        "Live stream", duid, (dynamic_password, client_id, oem, key), reuse=True
+        "Live stream", duid, (dynamic_password, client_id, oem, key),
+        reuse=True, warm_idle=warm_idle,
     ) as slot:
         return _stream_video(
-            slot, duid, dynamic_password, key, client_id, oem, duration, on_jpeg, should_stop,
+            slot, duid, dynamic_password, key, client_id, oem, duration, on_jpeg,
+            should_stop,
         )
 
 
@@ -2174,6 +2195,7 @@ async def async_p2p_open_door(
     locknumber: int = 0,
     data_encode_key: str | None = None,
     pin_sha256: str | None = None,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bool:
     """Unlock a door without blocking the event loop.
 
@@ -2194,7 +2216,7 @@ async def async_p2p_open_door(
     result = await hass.async_add_executor_job(
         functools.partial(
             p2p_open_door_sync, duid, dynamic_password, pin, client_id, oem, door,
-            locknumber, data_encode_key, pin_sha256,
+            locknumber, data_encode_key, pin_sha256, warm_idle,
         )
     )
     if result.acked:
@@ -2220,6 +2242,7 @@ async def async_p2p_get_snapshot(
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
     attempts: int = 2,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bytes | None:
     """Fetch a still image without blocking the event loop.
 
@@ -2230,7 +2253,7 @@ async def async_p2p_get_snapshot(
             functools.partial(
                 p2p_get_snapshot_sync, duid, dynamic_password,
                 data_encode_key=data_encode_key, client_id=client_id, oem=oem,
-                duration=duration,
+                duration=duration, warm_idle=warm_idle,
             )
         )
         if image:
@@ -2248,13 +2271,14 @@ async def async_p2p_record_clip(
     client_id: str = "",
     oem: str = DEFAULT_OEM,
     seconds: float = 5.0,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bytes | None:
     """Record a short MP4 clip without blocking the event loop."""
     return await hass.async_add_executor_job(
         functools.partial(
             p2p_record_clip_sync, duid, dynamic_password,
             data_encode_key=data_encode_key, client_id=client_id, oem=oem,
-            seconds=seconds,
+            seconds=seconds, warm_idle=warm_idle,
         )
     )
 
@@ -2269,6 +2293,7 @@ async def async_p2p_stream_video(
     duration: float = 90.0,
     on_jpeg: Callable[[bytes], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> int:
     """Run a live MJPEG stream in the executor.
 
@@ -2279,6 +2304,6 @@ async def async_p2p_stream_video(
     return await hass.async_add_executor_job(
         functools.partial(
             p2p_stream_video_sync, duid, dynamic_password, data_encode_key,
-            client_id, oem, duration, on_jpeg, should_stop,
+            client_id, oem, duration, on_jpeg, should_stop, warm_idle,
         )
     )

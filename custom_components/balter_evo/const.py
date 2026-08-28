@@ -9,6 +9,7 @@ DOMAIN = "balter_evo"
 
 CONF_DOOR_PIN = "door_pin"
 CONF_CLIENT_ID = "client_id"
+CONF_WARM_IDLE = "warm_idle"
 # Altlast: frueher konnte hier die client-id der Balter-App hinterlegt werden, weil
 # vermutet wurde, die P2P-Signalisierung akzeptiere nur registrierte ids. Live
 # widerlegt -- eine selbst erzeugte 16-Hex-ID funktioniert durchgaengig, die
@@ -49,9 +50,14 @@ P2P_MIN_GAP = 30.0
 # Punch, LOGIN) -- genau deshalb oeffnet die offizielle App beim zweiten Druck
 # sofort: sie haelt die Sitzung offen und schickt nur noch den Befehl. Wir machen
 # es genauso; danach wird die Sitzung geschlossen, damit Klingel und App den
-# einzigen Slot der Station wiederbekommen. Der Wert ist die Abwaegung zwischen
-# "zweites Oeffnen sofort" und "Station moeglichst schnell wieder frei".
-P2P_WARM_IDLE = 30.0
+# einzigen Slot der Station wiederbekommen.
+#
+# Der Wert ist die Abwaegung zwischen "zweites Oeffnen sofort" und "Station
+# moeglichst schnell wieder frei" und deshalb in den Optionen einstellbar.
+# 10 s decken das Nacheinander-Oeffnen ab (zweite Tuer, noch mal draufdruecken),
+# ohne die Station spuerbar zu blockieren. 0 schaltet das Offenhalten ab.
+DEFAULT_WARM_IDLE = 10.0
+WARM_IDLE_MAX = 60.0
 
 # Zwischenspeicher fuer die rotierenden Geraetegeheimnisse. Sie wechseln nur
 # woechentlich; haeufiger abzufragen belastet die Cloud ohne Nutzen.

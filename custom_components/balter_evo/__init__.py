@@ -14,7 +14,14 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import aiohttp_client
 
 from .api import BalterApiError, BalterAuthError, BalterCloudClient
-from .const import CONF_CLIENT_ID, CONF_SIGNALLING_ID, DEFAULT_LOCK
+from .const import (
+    CONF_CLIENT_ID,
+    CONF_SIGNALLING_ID,
+    CONF_WARM_IDLE,
+    DEFAULT_LOCK,
+    DEFAULT_WARM_IDLE,
+    WARM_IDLE_MAX,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +38,7 @@ class BalterRuntimeData:
     p2p_client_id: str = ""
     devices: list[dict[str, Any]] = field(default_factory=list)
     locks: list[dict[str, Any]] = field(default_factory=list)
+    warm_idle: float = DEFAULT_WARM_IDLE
 
 
 type BalterConfigEntry = ConfigEntry[BalterRuntimeData]
@@ -116,6 +124,19 @@ async def _async_collect_locks(
     ]
 
 
+def _warm_idle(entry: BalterConfigEntry) -> float:
+    """Return the configured session hold time, clamped to a sane range.
+
+    A value out of range would either defeat the point (negative) or block the
+    station for other residents far longer than any unlock needs.
+    """
+    try:
+        value = float(entry.data.get(CONF_WARM_IDLE, DEFAULT_WARM_IDLE))
+    except (TypeError, ValueError):
+        return DEFAULT_WARM_IDLE
+    return min(max(value, 0.0), WARM_IDLE_MAX)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bool:
     """Set up Balter EVO from a config entry."""
     p2p_client_id = _p2p_identity(hass, entry)
@@ -139,7 +160,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bo
         locks.extend(await _async_collect_locks(client, device))
 
     entry.runtime_data = BalterRuntimeData(
-        client=client, p2p_client_id=p2p_client_id, devices=devices, locks=locks
+        client=client, p2p_client_id=p2p_client_id, devices=devices, locks=locks,
+        warm_idle=_warm_idle(entry),
     )
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -147,7 +169,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bo
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> None:
-    """Reload when the door PIN was changed in the options."""
+    """Reload when the door PIN or the session hold time changed in the options."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 

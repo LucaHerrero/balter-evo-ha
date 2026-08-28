@@ -33,7 +33,8 @@ async def async_setup_entry(
     data = entry.runtime_data
     pin = entry.data.get(CONF_DOOR_PIN, "")
     async_add_entities(
-        BalterDoorLock(data.client, lock, pin, data.p2p_client_id) for lock in data.locks
+        BalterDoorLock(data.client, lock, pin, data.p2p_client_id, data.warm_idle)
+        for lock in data.locks
     )
 
 
@@ -45,13 +46,19 @@ class BalterDoorLock(LockEntity):
     _attr_icon = "mdi:door"
 
     def __init__(
-        self, client: BalterCloudClient, lock: dict, pin: str, client_id: str
+        self,
+        client: BalterCloudClient,
+        lock: dict,
+        pin: str,
+        client_id: str,
+        warm_idle: float,
     ) -> None:
         """Initialise one door-release relay entity."""
         self._client = client
         self._lock = lock
         self._pin = pin
         self._client_id = client_id
+        self._warm_idle = warm_idle
         self._attr_is_locked = True
         self._relock_unsub: Any = None
         self._attr_unique_id = f"{lock['duid']}_{lock['code']}"
@@ -125,6 +132,7 @@ class BalterDoorLock(LockEntity):
                 data_encode_key=creds.get("data_encode_key")
                 or self._lock.get("data_encode_key"),
                 pin_sha256=pin_sha256,
+                warm_idle=self._warm_idle,
             )
             if not success:
                 raise HomeAssistantError(
