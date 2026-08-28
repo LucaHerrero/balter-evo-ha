@@ -1967,8 +1967,12 @@ def _stream_video(
     duration: float = 90.0,
     on_jpeg: Callable[[bytes], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    ts_url: str | None = None,
 ) -> int:
     """Open a P2P video session and transcode the live H.264 stream to JPEGs.
+
+    ``ts_url`` additionally publishes the untouched H.264 as MPEG-TS, which is
+    what the Home Assistant stream component consumes.
 
     Calls ``on_jpeg(jpeg_bytes)`` for every decoded frame until ``duration``
     seconds elapse or ``should_stop()`` returns True. Returns the number of
@@ -1985,13 +1989,15 @@ def _stream_video(
     ffmpeg = _start_mjpeg_transcoder()
     if ffmpeg is None:
         return 0
+    remuxer = _start_ts_remuxer(ts_url)
 
     stop = threading.Event()
     frames_out = [0]
     workers = [
         threading.Thread(target=_jpeg_reader, args=(ffmpeg, stop, on_jpeg, frames_out),
                          name=f"balter-mjpeg-{duid}", daemon=True),
-        threading.Thread(target=_decrypt_pump, args=(ffmpeg, stop, assembler, key),
+        threading.Thread(target=_decrypt_pump,
+                         args=(ffmpeg, stop, assembler, key, remuxer),
                          name=f"balter-decrypt-{duid}", daemon=True),
     ]
     transport = _video_session(
@@ -2000,6 +2006,8 @@ def _stream_video(
     if transport is None:
         slot.drop_transport()
         _stop_ffmpeg(ffmpeg)
+        if remuxer is not None:
+            _stop_ffmpeg(remuxer)
         return 0
     try:
         for worker in workers:
@@ -2011,6 +2019,8 @@ def _stream_video(
         stop.set()
         _release_or_hand_over(slot, transport, "live stream")
         _stop_ffmpeg(ffmpeg)
+        if remuxer is not None:
+            _stop_ffmpeg(remuxer)
 
     _LOGGER.debug("Live stream ended for %s (%d frames)", duid, frames_out[0])
     return frames_out[0]
@@ -2085,7 +2095,13 @@ def _start_mjpeg_transcoder() -> subprocess.Popen[bytes] | None:
     """Start ffmpeg as an H.264 -> MJPEG pipe, or None if it is unavailable."""
     try:
         return subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
+            # KEIN "-fflags nobuffer": damit ueberspringt ffmpeg die Probe-Phase
+            # und kann den MJPEG-Encoder mangels Stromparametern nicht mehr
+            # oeffnen ("Could not open encoder before EOF") -- ab ffmpeg 9
+            # reproduzierbar, der Livestream lieferte dann still gar nichts.
+            # Ueber eine Pipe kostet die Probe rund 85 ms, neben dem 8-10 s
+            # langen P2P-Handshake also nichts.
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
              "-flags", "low_delay", "-f", "h264", "-i", "pipe:0",
              "-f", "mjpeg", "-q:v", "6", "pipe:1"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -2095,6 +2111,38 @@ def _start_mjpeg_transcoder() -> subprocess.Popen[bytes] | None:
             "FFmpeg could not be started -- the live stream needs ffmpeg on the "
             "Home Assistant host: %s", err,
         )
+        return None
+
+
+def _start_ts_remuxer(ts_url: str | None) -> subprocess.Popen[bytes] | None:
+    """Start ffmpeg as an H.264 -> MPEG-TS remuxer for the HA stream component.
+
+    Deliberately a SECOND process next to the MJPEG transcoder rather than a
+    second output of the same one: the container path is the new, unproven one,
+    and if it dies it must not take the working still-image and MJPEG path with
+    it. ``-c copy`` means no transcoding -- the H.264 is only wrapped, which
+    costs almost nothing.
+
+    MPEG-TS (not raw H.264) because the stream component has to be able to join
+    a running stream and needs timestamps and a self-describing container to do
+    it; ``resend_headers`` repeats PAT/PMT on every keyframe for the same reason.
+    """
+    if not ts_url:
+        return None
+    try:
+        return subprocess.Popen(
+            # "-fflags nobuffer" hier aus demselben Grund weggelassen wie beim
+            # MJPEG-Transcoder: ohne Probe-Phase kennt ffmpeg die Stromparameter
+            # nicht, die es auch fuer ein reines Umpacken braucht.
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-flags", "low_delay", "-f", "h264", "-i", "pipe:0",
+             "-c", "copy", "-f", "mpegts", "-mpegts_flags", "+resend_headers", ts_url],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError) as err:
+        # Kein harter Fehler: der Livestream laeuft ohne den Container-Ausgang
+        # als MJPEG weiter, nur eben ohne die stream-Integration.
+        _LOGGER.warning("Could not start the MPEG-TS remuxer for %s: %s", ts_url, err)
         return None
 
 
@@ -2140,20 +2188,37 @@ def _jpeg_reader(
                 on_jpeg(jpeg)
 
 
+def _feed(ffmpeg: subprocess.Popen[bytes] | None, chunk: bytes) -> bool:
+    """Write one chunk to an ffmpeg process; False once its pipe is gone."""
+    if ffmpeg is None or ffmpeg.stdin is None:
+        return False
+    try:
+        ffmpeg.stdin.write(chunk)
+        ffmpeg.stdin.flush()
+    except (BrokenPipeError, OSError):
+        return False
+    return True
+
+
 def _decrypt_pump(
     ffmpeg: subprocess.Popen[bytes],
     stop: threading.Event,
     assembler: _StreamAssembler,
     key: bytes,
+    remuxer: subprocess.Popen[bytes] | None = None,
 ) -> None:
     """Decrypt arriving media frames and feed them to ffmpeg.
 
     Everything before the first parameter set is dropped: ffmpeg cannot start on
     a half frame. Only the unsynchronised head is buffered, so memory stays flat
     however long the stream runs.
+
+    The same bytes go to the optional MPEG-TS remuxer. Its failure only ends the
+    container output; the MJPEG path keeps running.
     """
     if ffmpeg.stdin is None:
         return
+    feeding_remuxer = remuxer is not None
     tail = bytearray()      # angefangener App-Frame
     presync = bytearray()   # entschluesselte Bytes vor dem ersten NAL
     synced = False
@@ -2178,10 +2243,11 @@ def _decrypt_pump(
             chunk = presync[offset:]
             presync.clear()
             synced = True
-        try:
-            ffmpeg.stdin.write(bytes(chunk))
-            ffmpeg.stdin.flush()
-        except (BrokenPipeError, OSError):
+        payload = bytes(chunk)
+        if feeding_remuxer and not _feed(remuxer, payload):
+            _LOGGER.debug("MPEG-TS remuxer stopped -- continuing with MJPEG only")
+            feeding_remuxer = False
+        if not _feed(ffmpeg, payload):
             return
 
 
@@ -2258,6 +2324,7 @@ def p2p_stream_video_sync(
     on_jpeg: Callable[[bytes], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     warm_idle: float = DEFAULT_WARM_IDLE,
+    ts_url: str | None = None,
 ) -> int:
     """Live-Videostream -- serialisiert gegen jede andere P2P-Sitzung."""
     key = _session_key(data_encode_key)
@@ -2267,7 +2334,7 @@ def p2p_stream_video_sync(
     ) as slot:
         return _stream_video(
             slot, duid, dynamic_password, key, client_id, oem, duration, on_jpeg,
-            should_stop,
+            should_stop, ts_url,
         )
 
 
@@ -2383,6 +2450,7 @@ async def async_p2p_stream_video(
     on_jpeg: Callable[[bytes], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     warm_idle: float = DEFAULT_WARM_IDLE,
+    ts_url: str | None = None,
 ) -> int:
     """Run a live MJPEG stream in the executor.
 
@@ -2393,6 +2461,6 @@ async def async_p2p_stream_video(
     return await hass.async_add_executor_job(
         functools.partial(
             p2p_stream_video_sync, duid, dynamic_password, data_encode_key,
-            client_id, oem, duration, on_jpeg, should_stop, warm_idle,
+            client_id, oem, duration, on_jpeg, should_stop, warm_idle, ts_url,
         )
     )
