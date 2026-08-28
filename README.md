@@ -6,6 +6,17 @@ Inoffizielle Home-Assistant-Integration für die **Balter EVO 2** Video-Türspre
 
 ---
 
+### Neu in v0.11.1 — Robustheit der offen gehaltenen Sitzung
+
+Nacharbeiten aus einem Code-Review von v0.10.0/v0.11.0 — kein neues Verhalten, aber deutlich weniger Fälle, in denen die Verbindung unnötig neu aufgebaut wird oder die Türstation belegt bleibt.
+
+- **Ein verlorenes UDP-Paket verwirft die Sitzung nicht mehr.** Der Prüf-Frame vor jedem Befehl wird jetzt wiederholt; vorher genügte ein Paketverlust, um eine gesunde Sitzung als tot einzustufen — mit sofortigem Neuaufbau gegen die noch belegte Station und 30 s Strafe für den nächsten Versuch.
+- **Nachlaufzeit bei „Sitzung offen halten = 0".** Das Gerät bekommt wieder die 0,6 s zwischen Quittung und Verbindungsabbau, die es zum Ausführen braucht.
+- **Beim Entladen/Neuladen der Integration** werden offene Sitzungen geschlossen und laufende Cloud-Abfragen abgebrochen. Vorher blieb die Türstation nach jedem Speichern der Optionen bis zu einer Haltedauer lang belegt.
+- **Netzwerkfehler zur Cloud** werden jetzt sauber behandelt statt als Traceback im Log zu landen; die Gerätedaten fallen dabei zuverlässig auf den Zwischenspeicher zurück.
+- **Türöffnen wartet bis zu 1,5 s auf frische Geheimnisse**, statt sofort das gespeicherte Paar zu nehmen. Wichtig in der Woche, in der die Geheimnisse rotieren; hängt die Cloud, geht es wie bisher ohne Verzögerung weiter.
+- Nicht mehr erreichbare Signalisierungs-Server werden aus dem 30-Minuten-Zwischenspeicher entfernt, statt eine halbe Stunde lang jede Verbindung scheitern zu lassen.
+
 ### Neu in v0.11.0 — Haltedauer der Sitzung einstellbar
 
 Die in v0.10.0 eingeführte offen gehaltene Sitzung lässt sich jetzt unter **Konfigurieren → „Sitzung offen halten"** einstellen. **Der Standard sinkt von 30 s auf 10 s** — das deckt das Öffnen hintereinander ab, ohne die Türstation länger als nötig für Klingel und Handy-App zu belegen.

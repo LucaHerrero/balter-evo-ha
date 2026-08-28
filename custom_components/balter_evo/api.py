@@ -22,6 +22,7 @@ from .const import (
     CLIENT_TYPE,
     CLIENT_VERSION,
     CREDENTIAL_MAX_AGE,
+    CREDENTIAL_REFRESH_WAIT,
     CREDENTIAL_STALE_AGE,
     DISCOVERY_HOST,
     DISCOVERY_PATH,
@@ -217,16 +218,22 @@ class BalterCloudClient:
             await self.login()
 
         for attempt in (1, 2):
-            async with self._session.post(
-                self._base,
-                data=build_body(),
-                headers=self._headers(content_type),
-                ssl=self._ssl,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as resp:
-                self._remember_cookie(resp)
-                text = await resp.text()
-                status = resp.status
+            # Netzfehler als BalterApiError weiterreichen: die Aufrufer behandeln
+            # eine unerreichbare Cloud sonst nicht (Gerateliste faellt nicht auf
+            # den Cache zurueck, die Hintergrundauffrischung stirbt mit Traceback).
+            try:
+                async with self._session.post(
+                    self._base,
+                    data=build_body(),
+                    headers=self._headers(content_type),
+                    ssl=self._ssl,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    self._remember_cookie(resp)
+                    text = await resp.text()
+                    status = resp.status
+            except (aiohttp.ClientError, TimeoutError) as err:
+                raise BalterApiError(f"{context}: {err}") from err
 
             if status == 200:
                 if attempt == 1 and body_rejected is not None and body_rejected(text):
@@ -288,14 +295,17 @@ class BalterCloudClient:
     async def _bootstrap_session(self) -> None:
         """Obtain a fresh anonymous jsessionid for the resolved endpoint."""
         self._forget_session_cookie()
-        async with self._session.get(
-            self._base,
-            headers=self._headers(),
-            ssl=self._ssl,
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-        ) as resp:
-            self._remember_cookie(resp)
-            await resp.read()
+        try:
+            async with self._session.get(
+                self._base,
+                headers=self._headers(),
+                ssl=self._ssl,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                self._remember_cookie(resp)
+                await resp.read()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise BalterApiError(f"Could not reach {self._base}: {err}") from err
         # Manche Antworten tragen das Cookie nur im Jar (Redirect-Kette); von dort
         # holen, bevor wir aufgeben.
         if not self._jsessionid:
@@ -326,17 +336,20 @@ class BalterCloudClient:
             "</header>"
             "</envelope>"
         )
-        async with self._session.post(
-            self._base,
-            data=body.encode("utf-8"),
-            headers=self._headers("application/xml"),
-            ssl=self._ssl,
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-        ) as resp:
-            self._remember_cookie(resp)
-            text = await resp.text()
-            if resp.status != 200:
-                raise BalterApiError(f"Login HTTP {resp.status}: {text[:300]}")
+        try:
+            async with self._session.post(
+                self._base,
+                data=body.encode("utf-8"),
+                headers=self._headers("application/xml"),
+                ssl=self._ssl,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                self._remember_cookie(resp)
+                text = await resp.text()
+                if resp.status != 200:
+                    raise BalterApiError(f"Login HTTP {resp.status}: {text[:300]}")
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise BalterApiError(f"Login could not reach {self._base}: {err}") from err
 
         root = self._safe_parse_xml(text, "login")
         result = self._xml_text(root, "./header/result", "-1")
@@ -531,8 +544,12 @@ class BalterCloudClient:
         if cached and (time.time() - cached[0]) < max_age:
             return cached[1]
         if allow_stale and cached and (time.time() - cached[0]) < CREDENTIAL_STALE_AGE:
-            self._refresh_credentials_soon()
-            return cached[1]
+            # Kurz auf die Auffrischung warten, aber nicht auf sie angewiesen sein.
+            # Ohne das wuerde in der Woche, in der die Geheimnisse rotieren, ein
+            # Oeffnen mit totem Passwort losgeschickt -- das Geraet quittiert einen
+            # solchen LOGIN und laesst die Sitzung dann stumm verfallen.
+            await self._refresh_credentials_briefly()
+            return self._cred_cache.get(duid, cached)[1]
 
         try:
             await self.get_device_list()   # fuellt _cred_cache fuer alle Geraete
@@ -557,24 +574,46 @@ class BalterCloudClient:
             return {"dynamic_password": "", "data_encode_key": "", "out_auth_code": ""}
         return refreshed[1]
 
-    def _refresh_credentials_soon(self) -> None:
+    def _refresh_credentials_soon(self) -> asyncio.Task[None] | None:
         """Refresh the cached device secrets in the background, one run at a time."""
         if self._refresh_task is not None and not self._refresh_task.done():
-            return
+            return self._refresh_task
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
+            return None
         self._refresh_task = loop.create_task(self._refresh_credentials())
+        return self._refresh_task
+
+    async def _refresh_credentials_briefly(self) -> None:
+        """Give a background refresh a short head start, then carry on regardless."""
+        task = self._refresh_credentials_soon()
+        if task is None:
+            return
+        # shield: laeuft der Task fuer einen anderen Aufrufer weiter, darf unser
+        # Timeout ihn nicht abbrechen.
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), CREDENTIAL_REFRESH_WAIT)
 
     async def _refresh_credentials(self) -> None:
         """Pull a fresh device list; a temporarily unreachable cloud is not fatal."""
         try:
             await self.get_device_list()
-        except BalterApiError as err:
+        except (BalterApiError, aiohttp.ClientError, TimeoutError) as err:
             # Der Aufrufer arbeitet bereits mit dem zwischengespeicherten Paar
-            # weiter -- hier ist nichts zu retten und nichts zu melden.
+            # weiter -- hier ist nichts zu retten und nichts zu melden. Fangen
+            # muessen wir es trotzdem: eine unbeaufsichtigte Task wuerde den
+            # Fehler sonst als Traceback ins Log kippen.
             _LOGGER.debug("Background credential refresh failed: %s", err)
+
+    async def async_close(self) -> None:
+        """Cancel a running background refresh (called when the entry unloads)."""
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def get_dynamic_password(self, duid: str) -> str:
         """Return the current rotating device password, or "" if unavailable.

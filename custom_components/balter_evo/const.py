@@ -70,6 +70,13 @@ CREDENTIAL_MAX_AGE = 900.0
 # Aufgefrischt wird dann im Hintergrund.
 CREDENTIAL_STALE_AGE = 12 * 3600.0
 
+# Wie lange ein Tueroeffnen hoechstens auf frische Geheimnisse wartet, bevor es
+# mit dem zwischengespeicherten Paar losgeht. Die Cloud antwortet normalerweise
+# in ~300 ms; so bekommt der haeufige Fall die frischen Werte (wichtig genau in
+# der Woche, in der sie rotieren), waehrend eine haengende Cloud das Oeffnen
+# nicht mehr aufhaelt.
+CREDENTIAL_REFRESH_WAIT = 1.5
+
 # Mindestalter, ab dem ein neues Standbild geholt wird. Muss ueber dem
 # Slot-Zyklus liegen (P2P_MIN_GAP + Dauer eines Snapshots, zusammen rund 40 s):
 # ein kuerzerer Wert laesst ein offenes Dashboard die Tuerstation dauerhaft

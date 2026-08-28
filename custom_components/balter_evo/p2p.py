@@ -109,9 +109,18 @@ OPENDOOR_MAX_SENDS = 3
 OPENDOOR_RESEND_AFTER = 1.2
 CLOSE_LINGER = 0.3
 
+# Die echte App laesst zwischen Quittung und Sitzungsende ~1,7 s vergehen. Bleibt
+# die Sitzung ohnehin offen, ergibt sich diese Nachlaufzeit von selbst -- wird sie
+# dagegen sofort geschlossen (warm_idle=0), muss sie ausdruecklich abgewartet
+# werden, damit das Geraet den Befehl noch ausfuehren kann.
+POST_UNLOCK_SETTLE = 0.6
+
 # Wie lange auf die Transport-Quittung des Pruef-Frames gewartet wird, mit dem
-# eine warm gehaltene Sitzung vor dem naechsten Befehl abgeklopft wird.
-WARM_PROBE_TIMEOUT = 1.0
+# eine warm gehaltene Sitzung vor dem naechsten Befehl abgeklopft wird -- inkl.
+# einer Wiederholung, denn ein einzelnes verlorenes UDP-Paket darf eine gesunde
+# Sitzung nicht als tot erscheinen lassen.
+WARM_PROBE_TIMEOUT = 1.6
+WARM_PROBE_RESEND = 0.5
 
 # Die Discovery-Antwort nennt nur Serveradressen und die (mit der client-id
 # verschluesselten) MQTT-Zugangsdaten. Zwischen zwei Tueroeffnungen aendert sich
@@ -186,6 +195,11 @@ class _WarmSession:
         self.signature = signature
         self._stop = threading.Event()
         self._expiry = time.monotonic() + idle
+        # Wer die Sitzung am Ende schliesst. Solange False, raeumt der Thread
+        # selbst auf -- auch dann, wenn ein Aufrufer die Verantwortung abgibt,
+        # weil der Thread haengt. Genau ein Schliessen, nie zwei, nie keins.
+        self._handover = threading.Lock()
+        self._caller_owns = False
         self._thread = threading.Thread(
             target=self._run, name=f"balter-p2p-warm-{duid}", daemon=True
         )
@@ -202,28 +216,50 @@ class _WarmSession:
                 if _WARM.get(self.duid) is not self:
                     return
                 del _WARM[self.duid]
-            _LOGGER.debug(
-                "Warm P2P session with %s expired -- releasing the station", self.duid
-            )
-            self.transport.close()
-            _mark_session_end(self.duid)
+            self._close("expired")
             return
+        with self._handover:
+            orphaned = not self._caller_owns
+        if orphaned:
+            # Der Aufrufer hat nicht auf uns gewartet -- die Sitzung gehoert sonst
+            # niemandem mehr und wuerde die Station endlos belegen.
+            self._close("handover gave up")
 
-    def _halt(self) -> None:
-        """Stop the keepalive thread; the caller decides what happens next."""
+    def _close(self, why: str) -> None:
+        _LOGGER.debug("Warm P2P session with %s %s -- releasing the station", self.duid, why)
+        self.transport.close()
+        _mark_session_end(self.duid)
+
+    def _halt(self) -> bool:
+        """Stop the keepalive thread and take ownership; False if it did not stop.
+
+        Ownership is what keeps the session from being closed twice (or not at
+        all): the thread only cleans up while it still owns the session.
+        """
+        with self._handover:
+            self._caller_owns = True
         self._stop.set()
         self._thread.join(timeout=1.0)
+        if not self._thread.is_alive():
+            return True
+        # Der Thread haengt (blockierendes sendto). Ihm die Sitzung zurueckgeben,
+        # statt parallel auf demselben Socket zu arbeiten.
+        with self._handover:
+            self._caller_owns = False
+        _LOGGER.warning(
+            "The keepalive thread for %s did not stop in time -- leaving the session to it",
+            self.duid,
+        )
+        return False
 
-    def take(self) -> _P2PTransport:
+    def take(self) -> _P2PTransport | None:
         """Stop the keepalive and hand the still-open session to the caller."""
-        self._halt()
-        return self.transport
+        return self.transport if self._halt() else None
 
     def discard(self) -> None:
         """Stop the keepalive and close the session."""
-        self._halt()
-        self.transport.close()
-        _mark_session_end(self.duid)
+        if self._halt():
+            self._close("released")
 
 
 def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport | None:
@@ -244,6 +280,16 @@ def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport 
         _LOGGER.debug("Closing the warm P2P session with %s -- its slot is needed", warm.duid)
         warm.discard()
     return wanted.take() if wanted is not None else None
+
+
+def release_all_sessions() -> None:
+    """Close every session kept open, so the station is free again.
+
+    Called when the integration unloads: the keepalive threads are daemons and
+    would otherwise keep pinging -- and keep the station busy for the doorbell
+    and the phone app -- until their hold time runs out.
+    """
+    _take_warm(None, None)
 
 
 def _store_warm(
@@ -284,6 +330,8 @@ class _P2PSlot:
         self._warm_idle = warm_idle
         self.transport: _P2PTransport | None = None
         self.keep_warm = False
+        # Nachlaufzeit, die dem Geraet vor einem Close noch bleiben muss.
+        self.settle = 0.0
 
     def __enter__(self) -> _P2PSlot:
         started = time.monotonic()
@@ -330,10 +378,15 @@ class _P2PSlot:
     def __exit__(self, *exc: object) -> None:
         transport = self.transport
         self.transport = None
-        if transport is not None and self.keep_warm and exc[0] is None:
+        if transport is not None and self.keep_warm and exc[0] is None and self._warm_idle > 0:
             _store_warm(self._duid, transport, self._signature, self._warm_idle)
         else:
             if transport is not None:
+                # Die Sitzung bleibt nicht stehen, also die Nachlaufzeit hier
+                # abwarten -- sonst raeumt der Close den Befehl weg, den das
+                # Geraet gerade erst ausfuehrt.
+                if self.settle > 0:
+                    time.sleep(self.settle)
                 transport.close()
             _mark_session_end(self._duid)
         _P2P_GATE.release()
@@ -837,7 +890,14 @@ class CloudP2PSession:
         self.cli.tls_set_context(ctx)
         self.cli.on_connect = self._on_connect
         self.cli.on_message = self._on_message
-        self.cli.connect(host, port, keepalive=30)
+        try:
+            self.cli.connect(host, port, keepalive=30)
+        except OSError:
+            # Die Adresse kam aus dem Discovery-Zwischenspeicher. Bleibt sie dort
+            # stehen, scheitert jede Sitzung bis zum Ablauf der TTL -- obwohl eine
+            # frische Abfrage den umgezogenen Broker sofort liefern wuerde.
+            _discovery_forget(self.client_id)
+            raise
         self.cli.loop_start()
 
         if not self.registered.wait(self.REGISTER_TIMEOUT):
@@ -1070,6 +1130,15 @@ class _P2PTransport:
         relay = cloud.wait_for_relay(RELAY_TIMEOUT)
 
         nat_thread.join(timeout=NATCHECK_TIMEOUT * 5 + 1.0)
+        if nat_thread.is_alive():
+            # Ab hier teilen Empfangsschleife und Punch sich den Socket. Ein noch
+            # laufender NAT-Check wuerde ihnen Pakete wegfangen und das Timeout
+            # unter den Fuessen wegziehen -- lieber sauber scheitern.
+            _LOGGER.error(
+                "NAT check for %s did not finish -- aborting this session instead of "
+                "sharing the socket with it", self._duid,
+            )
+            return False
         public_ip, public_port = natcheck[0] if natcheck else ("0.0.0.0", 0)
         if public_port:
             _LOGGER.debug(
@@ -1674,8 +1743,10 @@ def _open_door(
         # Die Sitzung bleibt stehen. Das gibt dem Geraet dieselbe Nachlaufzeit,
         # die sich auch die echte App nimmt (~1,7 s zwischen Quittung und
         # Sitzungsende), kostet den Nutzer aber keine Wartezeit mehr -- und das
-        # naechste Oeffnen kommt ohne jeden Neuaufbau aus.
+        # naechste Oeffnen kommt ohne jeden Neuaufbau aus. Wird sie doch sofort
+        # geschlossen (warm_idle=0), muss die Nachlaufzeit abgewartet werden.
         slot.keep_warm = True
+        slot.settle = POST_UNLOCK_SETTLE
         _LOGGER.debug("Door unlock confirmed by device")
     elif result.sent:
         _LOGGER.error(
@@ -1700,11 +1771,20 @@ def _warm_session_alive(transport: _P2PTransport, deadline: float) -> bool:
         _, end = transport.send_ctrl(4, 0xFE, b"\x00", msg13=2)
     except (P2PError, OSError):
         return False
-    probe_deadline = min(deadline, time.monotonic() + WARM_PROBE_TIMEOUT)
+    sent_at = time.monotonic()
+    resent = False
+    probe_deadline = min(deadline, sent_at + WARM_PROBE_TIMEOUT)
     while time.monotonic() < probe_deadline:
         transport.maintain()
         if chan.peer_ack >= end:
             return True
+        # Ein einzelnes verlorenes Datagramm darf eine gesunde Sitzung nicht als
+        # tot erscheinen lassen: der Neuaufbau ueberspringt danach den
+        # Erholungsabstand und laeuft der noch belegten Station ins Messer.
+        # Wiederholung am ORIGINAL-Offset, damit das Geraet sie als Dublette sieht.
+        if not resent and time.monotonic() - sent_at > WARM_PROBE_RESEND:
+            transport.resend_last(CH0)
+            resent = True
         time.sleep(0.01)
     _LOGGER.debug(
         "The session kept open with %s went stale -- reconnecting", transport.duid

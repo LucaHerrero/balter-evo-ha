@@ -14,6 +14,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import aiohttp_client
 
 from .api import BalterApiError, BalterAuthError, BalterCloudClient
+from .p2p import release_all_sessions
 from .const import (
     CONF_CLIENT_ID,
     CONF_SIGNALLING_ID,
@@ -174,5 +175,12 @@ async def _async_reload_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> 
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: BalterConfigEntry) -> bool:
-    """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    """Unload a config entry, leaving nothing of ours running."""
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    # Beides laeuft ausserhalb der Plattformen weiter: eine offen gehaltene
+    # P2P-Sitzung wuerde die Station bis zu ihrer Haltedauer weiter belegen (auch
+    # fuer Klingel und Handy-App), und eine laufende Hintergrundauffrischung
+    # gehoert zu einem Eintrag, den es gleich nicht mehr gibt.
+    await hass.async_add_executor_job(release_all_sessions)
+    await entry.runtime_data.client.async_close()
+    return unloaded
