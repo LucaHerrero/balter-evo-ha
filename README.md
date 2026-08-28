@@ -143,6 +143,7 @@ logger:
 | Tür geht auf, HA meldet trotzdem einen Fehler | Sollte seit v0.9.0 nicht mehr vorkommen. Mit Debug-Log melden. |
 | Öffnen wird angenommen, aber nichts passiert | Meist eine eingetragene Tür-PIN, die nicht zum Gerät passt. Feld leer lassen. Das Log warnt in diesem Fall. |
 | Kein Kamerabild, Türöffnen geht | `ffmpeg` fehlt auf dem HA-Host. |
+| Bild zerläuft in bunte Blöcke, friert kurz ein | Paketverlust auf dem Weg zur Türstation. Am Ende jedes Streams steht die Verlustrate als Warnung im Log. Meist WLAN-Empfang an der Station. |
 
 ## Entwicklung
 
@@ -162,6 +163,7 @@ Die vollständigen Notizen stehen unter [Releases](https://github.com/LucaHerrer
 
 | Version | Kurz |
 |---|---|
+| **0.12.1** | Verlorene Videopakete werden nicht mehr durch Nullbytes ersetzt — das war die Ursache für zerlaufende, minutenlang stehenbleibende Bildfehler. Stattdessen kurzes Einfrieren und sauberes Aufsetzen; der Verlust steht jetzt im Log. |
 | **0.12.0** | Button **Live-Bild (90 s)** je Türstation; der Livestream steht zusätzlich der `stream`-Integration als H.264 zur Verfügung. Behoben: `-fflags nobuffer` legte ab ffmpeg 9 den kompletten Videoweg still lahm. |
 | **0.11.x** | Haltedauer der Sitzung einstellbar (Standard 10 s, 0 = aus); Robustheit: verlorene Pakete verwerfen die Sitzung nicht mehr, sauberes Aufräumen beim Entladen, Netzfehler zur Cloud werden abgefangen. |
 | **0.10.0** | Sitzung bleibt nach dem Öffnen stehen → **mehrfaches Öffnen hintereinander**, erstes Öffnen deutlich schneller. Kamerasitzungen werden ans Türöffnen weitergereicht. |

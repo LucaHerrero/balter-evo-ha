@@ -1522,11 +1522,20 @@ class _StreamAssembler:
 
     The device numbers its bytes like TCP, and UDP delivers them out of order,
     so segments are buffered until the missing bytes turn up. A gap still open
-    after ``GAP_TIMEOUT`` is zero-filled, otherwise a single lost packet would
-    stall the video for good. Consumed segments are dropped, which keeps the
-    cost of :meth:`read` proportional to the new data rather than to the whole
-    session -- the difference between a smooth 90-second stream and one that
-    slows down the longer it runs.
+    after ``GAP_TIMEOUT`` is given up on and *reported*: :meth:`read` stops at
+    it and :meth:`take_loss` tells the consumer how many bytes were skipped, so
+    it can restart cleanly at the next key frame.
+
+    What must NOT happen is filling the hole with made-up bytes. A decoder has
+    no way to know they are invented: it decodes them as picture data, which
+    smears the affected macroblocks -- and because every following P-frame
+    refers back to them, the damage stays on screen until the next key frame.
+    A short freeze is the better trade.
+
+    Consumed segments are dropped, which keeps the cost of :meth:`read`
+    proportional to the new data rather than to the whole session -- the
+    difference between a smooth 90-second stream and one that slows down the
+    longer it runs.
     """
 
     GAP_TIMEOUT = 1.0
@@ -1538,7 +1547,9 @@ class _StreamAssembler:
         self._next: int | None = None
         self._gap_since: float | None = None
         self._delivered = False
+        self._lost = 0
         self.total = 0
+        self.lost_total = 0
 
     def add(self, seq: int, data: bytes) -> None:
         """Take one received segment (called from the receive thread)."""
@@ -1557,8 +1568,17 @@ class _StreamAssembler:
                 self._segments[seq] = data
                 self.total += len(data)
 
+    def take_loss(self) -> int:
+        """Return how many bytes the last :meth:`read` had to skip, then reset."""
+        with self._lock:
+            lost, self._lost = self._lost, 0
+        return lost
+
     def read(self, flush: bool = False) -> bytes:
-        """Return the next contiguous bytes; ``flush`` closes all gaps at once."""
+        """Return the next contiguous bytes, stopping at an expired gap.
+
+        ``flush`` gives up on gaps immediately instead of waiting them out.
+        """
         out = bytearray()
         with self._lock:
             while self._next is not None:
@@ -1573,11 +1593,17 @@ class _StreamAssembler:
                     break
                 if not flush and not self._gap_expired():
                     break
-                # Verlorene Bytes auffuellen, damit der Decoder wieder aufsetzt.
+                # Die Luecke ueberspringen und melden -- niemals Bytes erfinden.
                 following = min(ahead)
-                out += bytes(following - self._next)
+                missing = following - self._next
+                self._lost += missing
+                self.lost_total += missing
                 self._next = following
                 self._gap_since = None
+                # Hier abbrechen: alles bis zur Luecke ist heil und darf noch
+                # ausgeliefert werden, alles danach gehoert schon hinter den
+                # Bruch. Der Verbraucher sieht so genau, wo er aufsetzen muss.
+                break
             if out:
                 self._delivered = True
         return bytes(out)
@@ -1876,7 +1902,10 @@ def _grab_video(
     finally:
         _release_or_hand_over(slot, transport, "snapshot")
 
-    _LOGGER.debug("Received %d B of media on CH0 from %s", assembler.total, duid)
+    _LOGGER.debug(
+        "Received %d B of media on CH0 from %s (%d B lost)",
+        assembler.total, duid, assembler.lost_total,
+    )
     frames = [frame for _, frame in extract_app_frames(assembler.read(flush=True))]
     h264 = _decode_media(frames, (key, FALLBACK_KEY)) if frames else None
     if not h264:
@@ -2022,6 +2051,14 @@ def _stream_video(
         if remuxer is not None:
             _stop_ffmpeg(remuxer)
 
+    if assembler.lost_total:
+        _LOGGER.warning(
+            "Live stream for %s lost %d of %d B of media (%.1f%%) -- the picture "
+            "will have frozen briefly each time. Usually WLAN reception at the "
+            "door station or a congested link.",
+            duid, assembler.lost_total, assembler.total,
+            100.0 * assembler.lost_total / max(1, assembler.total),
+        )
     _LOGGER.debug("Live stream ended for %s (%d frames)", duid, frames_out[0])
     return frames_out[0]
 
@@ -2225,15 +2262,16 @@ def _decrypt_pump(
     while not stop.is_set():
         time.sleep(0.2)
         tail += assembler.read()
+        lost = assembler.take_loss()
         frames, consumed = split_app_frames(bytes(tail))
         del tail[:consumed]
-        if not frames:
-            continue
 
         chunk = bytearray()
         for frame in frames:
             chunk += decrypt_head(frame[APP_HDR:], key)
-        if not synced:
+        if not chunk and not lost:
+            continue
+        if not synced and chunk:
             presync += chunk
             offset = first_nal_offset(presync)
             if offset < 0:
@@ -2244,11 +2282,24 @@ def _decrypt_pump(
             presync.clear()
             synced = True
         payload = bytes(chunk)
-        if feeding_remuxer and not _feed(remuxer, payload):
-            _LOGGER.debug("MPEG-TS remuxer stopped -- continuing with MJPEG only")
-            feeding_remuxer = False
-        if not _feed(ffmpeg, payload):
-            return
+        if payload:
+            if feeding_remuxer and not _feed(remuxer, payload):
+                _LOGGER.debug("MPEG-TS remuxer stopped -- continuing with MJPEG only")
+                feeding_remuxer = False
+            if not _feed(ffmpeg, payload):
+                return
+
+        if lost:
+            # Der angefangene App-Frame ist abgeschnitten, und der Decoder
+            # arbeitet ab jetzt auf einer unvollstaendigen Referenz weiter.
+            # Beides wegwerfen und erst am naechsten Parametersatz wieder
+            # aufsetzen -- kurz einfrieren statt lange zerlaufen.
+            _LOGGER.debug(
+                "Lost %d B of media -- resyncing at the next key frame", lost
+            )
+            tail.clear()
+            presync.clear()
+            synced = False
 
 
 # --- Öffentliche, serialisierte Einstiegspunkte ------------------------------

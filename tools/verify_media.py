@@ -169,8 +169,40 @@ def main() -> int:
     assert p2p._feed(None, b"x") is False
     print("  ok: ohne ts_url laeuft alles wie bisher, nur ohne Container-Ausgang")
 
-    print("\n4 Pruefungen bestanden")
+    check_gap()
+    print("\n6 Pruefungen bestanden")
     return 0
+
+
+def check_gap() -> None:
+    """Eine Luecke darf niemals mit erfundenen Bytes gestopft werden.
+
+    Genau das erzeugt sonst zerlaufende Makrobloecke, die bis zum naechsten
+    Schluesselbild stehen bleiben: der Decoder kann Nullbytes nicht von echten
+    Bilddaten unterscheiden und rechnet mit ihnen weiter.
+    """
+    assembler = p2p._StreamAssembler()
+    assembler.GAP_TIMEOUT = 0.0          # die Luecke sofort aufgeben
+    assembler.add(1, b"A" * 100)         # Bytes 1..101
+    assembler.add(301, b"B" * 100)       # davor fehlen 200 B
+
+    # Erster Durchgang: heile Daten raus, die Karenzzeit der Luecke faengt an.
+    before = assembler.read()
+    assert before == b"A" * 100, f"heile Daten vor der Luecke fehlen: {len(before)} B"
+    assert assembler.take_loss() == 0, "die Luecke wurde ohne Karenzzeit aufgegeben"
+
+    # Zweiter Durchgang: Karenzzeit abgelaufen -> ueberspringen und melden.
+    filler = assembler.read()
+    assert filler == b"", f"es wurden {len(filler)} B in die Luecke geschoben"
+    lost = assembler.take_loss()
+    assert lost == 200, f"Luecke falsch gemeldet: {lost} statt 200"
+    assert assembler.take_loss() == 0, "die Meldung wurde nicht zurueckgesetzt"
+    print(f"  ok: Luecke wird gemeldet ({lost} B), nicht mit Nullen gestopft")
+
+    after = assembler.read()
+    assert after == b"B" * 100, f"hinter der Luecke geht es nicht weiter: {len(after)} B"
+    assert assembler.lost_total == 200
+    print("  ok: hinter der Luecke laeuft der Strom sauber weiter")
 
 
 if __name__ == "__main__":
