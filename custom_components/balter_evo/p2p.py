@@ -279,7 +279,16 @@ def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport 
     for warm in stale:
         _LOGGER.debug("Closing the warm P2P session with %s -- its slot is needed", warm.duid)
         warm.discard()
-    return wanted.take() if wanted is not None else None
+    if wanted is None:
+        return None
+    transport = wanted.take()
+    if transport is None:
+        # Der Keepalive-Thread haengt und haelt die Sitzung weiter offen. Die
+        # Station ist also gerade NICHT frei -- ohne diese Markierung wuerde
+        # gleich eine zweite Sitzung danebengebaut, genau das, was das Geraet
+        # nicht vertraegt (P2P_PROTOCOL.md §10.3).
+        _mark_session_end(wanted.duid)
+    return transport
 
 
 def release_all_sessions() -> None:

@@ -6,6 +6,11 @@ Inoffizielle Home-Assistant-Integration für die **Balter EVO 2** Video-Türspre
 
 ---
 
+### Neu in v0.11.2 — zwei Nachträge aus einem zweiten Durchgang
+
+- **Lässt sich der Keepalive-Thread ausnahmsweise nicht stoppen, hält er die Sitzung weiter offen** — die Station ist dann also gerade *nicht* frei. Die Integration wartet in diesem Fall jetzt den Erholungsabstand ab, statt sofort eine zweite Verbindung danebenzubauen; genau das verträgt das Gerät nicht.
+- **Die Hintergrund-Auffrischung der Zugangsdaten kann das Türöffnen nicht mehr scheitern lassen.** Seit v0.11.1 wartet das Öffnen kurz auf sie — ein unerwarteter Fehler darin hätte den Befehl mitgerissen, obwohl die gespeicherten Werte völlig ausgereicht hätten.
+
 ### Neu in v0.11.1 — Robustheit der offen gehaltenen Sitzung
 
 Nacharbeiten aus einem Code-Review von v0.10.0/v0.11.0 — kein neues Verhalten, aber deutlich weniger Fälle, in denen die Verbindung unnötig neu aufgebaut wird oder die Türstation belegt bleibt.

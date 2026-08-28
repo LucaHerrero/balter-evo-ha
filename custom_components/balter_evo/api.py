@@ -605,6 +605,12 @@ class BalterCloudClient:
             # muessen wir es trotzdem: eine unbeaufsichtigte Task wuerde den
             # Fehler sonst als Traceback ins Log kippen.
             _LOGGER.debug("Background credential refresh failed: %s", err)
+        except Exception:  # noqa: BLE001 -- losgeloeste Aufgabe, siehe unten
+            # Diese Aufgabe laeuft unbeaufsichtigt UND wird vom Tueroeffnen kurz
+            # abgewartet. Ein unerwarteter Fehler duerfte weder als Traceback im
+            # Log landen noch das Oeffnen scheitern lassen, das ohnehin mit den
+            # zwischengespeicherten Werten weiterarbeiten kann.
+            _LOGGER.exception("Unexpected error while refreshing device credentials")
 
     async def async_close(self) -> None:
         """Cancel a running background refresh (called when the entry unloads)."""
