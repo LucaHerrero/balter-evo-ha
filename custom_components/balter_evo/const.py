@@ -44,9 +44,25 @@ STREAM_STOP_TIMEOUT = 5.0
 # diesen Mindestabstand ein (live beobachtet, siehe P2P_PROTOCOL.md §10.3).
 P2P_MIN_GAP = 30.0
 
+# Wie lange eine Sitzung nach einem Kommando offen gehalten wird. Ihr Neuaufbau
+# kostet je nach Netz 5-8 s (NAT-Check, Cloud-Discovery, MQTT-Signalisierung,
+# Punch, LOGIN) -- genau deshalb oeffnet die offizielle App beim zweiten Druck
+# sofort: sie haelt die Sitzung offen und schickt nur noch den Befehl. Wir machen
+# es genauso; danach wird die Sitzung geschlossen, damit Klingel und App den
+# einzigen Slot der Station wiederbekommen. Der Wert ist die Abwaegung zwischen
+# "zweites Oeffnen sofort" und "Station moeglichst schnell wieder frei".
+P2P_WARM_IDLE = 30.0
+
 # Zwischenspeicher fuer die rotierenden Geraetegeheimnisse. Sie wechseln nur
 # woechentlich; haeufiger abzufragen belastet die Cloud ohne Nutzen.
 CREDENTIAL_MAX_AGE = 900.0
+
+# Alter, bis zu dem ein zwischengespeichertes Paar ohne Rueckfrage bei der Cloud
+# benutzt wird. Auf dem Weg zum Tueroeffnen darf eine langsame oder gestoerte
+# Cloud-Verbindung den Befehl nicht aufhalten: die Geheimnisse rotieren
+# woechentlich, ein Paar von heute morgen ist praktisch immer noch gueltig.
+# Aufgefrischt wird dann im Hintergrund.
+CREDENTIAL_STALE_AGE = 12 * 3600.0
 
 # Mindestalter, ab dem ein neues Standbild geholt wird. Muss ueber dem
 # Slot-Zyklus liegen (P2P_MIN_GAP + Dauer eines Snapshots, zusammen rund 40 s):

@@ -44,7 +44,14 @@ import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from homeassistant.core import HomeAssistant
 
-from .const import APP_ID, CLIENT_TYPE, OEM_ID, OEM_ID_COMPACT, P2P_MIN_GAP
+from .const import (
+    APP_ID,
+    CLIENT_TYPE,
+    OEM_ID,
+    OEM_ID_COMPACT,
+    P2P_MIN_GAP,
+    P2P_WARM_IDLE,
+)
 from .qv_kdf import decode_cred
 
 _LOGGER = logging.getLogger(__name__)
@@ -100,8 +107,16 @@ LOGIN_TIMEOUT = 8.0
 DOOR_SESSION_TIMEOUT = 20.0
 OPENDOOR_MAX_SENDS = 3
 OPENDOOR_RESEND_AFTER = 1.2
-POST_UNLOCK_SETTLE = 0.6
 CLOSE_LINGER = 0.3
+
+# Wie lange auf die Transport-Quittung des Pruef-Frames gewartet wird, mit dem
+# eine warm gehaltene Sitzung vor dem naechsten Befehl abgeklopft wird.
+WARM_PROBE_TIMEOUT = 1.0
+
+# Die Discovery-Antwort nennt nur Serveradressen und die (mit der client-id
+# verschluesselten) MQTT-Zugangsdaten. Zwischen zwei Tueroeffnungen aendert sich
+# daran nichts, also nicht jedes Mal TLS-Handshake und Round-Trip bezahlen.
+DISCOVERY_TTL = 1800.0
 
 KCP_PARAM = {
     "mode": "custom",
@@ -126,22 +141,142 @@ KCP_PARAM = {
 # (live beobachtet, siehe P2P_PROTOCOL.md §10.3). Kamera-Snapshot und Tueroeffnen
 # muessen sich deshalb einen einzigen Slot teilen und Abstand halten.
 _P2P_GATE = threading.Lock()
-_P2P_LAST_END = 0.0
+
+# Der Erholungsabstand gilt der Station, nicht dem Prozess: ein Schnappschuss von
+# Tuerstation A darf das Oeffnen an Tuerstation B nicht ausbremsen.
+_P2P_LAST_END: dict[str, float] = {}
 
 # Tueroeffnen geht vor Videobild. Der haeufigste Ablauf ist: es klingelt, man
 # schaut das Kamerabild an und oeffnet dann -- genau dann haelt der Livestream
 # aber den einzigen P2P-Slot der Station, bis zu STREAM_DURATION Sekunden lang.
-# Ein angefordertes Oeffnen setzt darum dieses Signal, und laufende Streams
-# raeumen den Slot daraufhin von sich aus.
+# Ein angefordertes Oeffnen setzt darum dieses Signal; laufende Streams und
+# Schnappschuesse raeumen den Slot daraufhin von sich aus und reichen ihre
+# bereits eingeloggte Sitzung sogar direkt weiter.
 _UNLOCK_WANTED = threading.Event()
+
+# Nach einem Kommando offen gehaltene Sitzungen, je Geraet hoechstens eine.
+_WARM: dict[str, _WarmSession] = {}
+_WARM_LOCK = threading.Lock()
+
+# Was eine Sitzung wiederverwendbar macht: dieselben Geheimnisse, dieselbe
+# Identitaet. Rotiert die Cloud den Schluessel, passt die Signatur nicht mehr und
+# die alte Sitzung wird verworfen, statt mit totem Schluessel weiterbenutzt.
+type _Signature = tuple[str, str, str, bytes]
+
+
+def _mark_session_end(duid: str) -> None:
+    """Note that the station just lost its P2P session and needs recovery time."""
+    _P2P_LAST_END[duid] = time.monotonic()
+
+
+class _WarmSession:
+    """Eine nach dem Befehl offen gehaltene Sitzung samt Keepalive-Thread.
+
+    Der Thread uebernimmt genau die Pflege, die sonst der Aufrufer betreibt
+    (Heartbeat-Proben und ARQ-Wiederholungen). Ohne ihn liefe die Sitzung binnen
+    Sekunden aus -- mit ihm bedient sie das naechste Kommando in Millisekunden.
+    """
+
+    def __init__(self, duid: str, transport: _P2PTransport, signature: _Signature) -> None:
+        """Start keeping ``transport`` alive for at most ``P2P_WARM_IDLE`` seconds."""
+        self.duid = duid
+        self.transport = transport
+        self.signature = signature
+        self._stop = threading.Event()
+        self._expiry = time.monotonic() + P2P_WARM_IDLE
+        self._thread = threading.Thread(
+            target=self._run, name=f"balter-p2p-warm-{duid}", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.01):
+            if time.monotonic() < self._expiry:
+                self.transport.maintain()
+                continue
+            # Abgelaufen. Nur schliessen, wenn uns nicht gerade jemand uebernimmt --
+            # sonst bekaeme der Uebernehmer eine geschlossene Sitzung in die Hand.
+            with _WARM_LOCK:
+                if _WARM.get(self.duid) is not self:
+                    return
+                del _WARM[self.duid]
+            _LOGGER.debug(
+                "Warm P2P session with %s expired -- releasing the station", self.duid
+            )
+            self.transport.close()
+            _mark_session_end(self.duid)
+            return
+
+    def _halt(self) -> None:
+        """Stop the keepalive thread; the caller decides what happens next."""
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def take(self) -> _P2PTransport:
+        """Stop the keepalive and hand the still-open session to the caller."""
+        self._halt()
+        return self.transport
+
+    def discard(self) -> None:
+        """Stop the keepalive and close the session."""
+        self._halt()
+        self.transport.close()
+        _mark_session_end(self.duid)
+
+
+def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport | None:
+    """Adopt the warm session of ``duid`` and release every other one.
+
+    Only ONE station session may be open at a time, so anything held for another
+    device (or with outdated secrets) is closed here rather than left to expire.
+    """
+    wanted: _WarmSession | None = None
+    stale: list[_WarmSession] = []
+    with _WARM_LOCK:
+        for key in list(_WARM):
+            if duid is not None and key == duid and _WARM[key].signature == signature:
+                wanted = _WARM.pop(key)
+            else:
+                stale.append(_WARM.pop(key))
+    for warm in stale:
+        _LOGGER.debug("Closing the warm P2P session with %s -- its slot is needed", warm.duid)
+        warm.discard()
+    return wanted.take() if wanted is not None else None
+
+
+def _store_warm(duid: str, transport: _P2PTransport, signature: _Signature | None) -> None:
+    """Keep ``transport`` open so the next command needs no handshake at all."""
+    if signature is None:
+        transport.close()
+        _mark_session_end(duid)
+        return
+    with _WARM_LOCK:
+        _WARM[duid] = _WarmSession(duid, transport, signature)
+    _LOGGER.debug("Keeping the P2P session with %s warm for %.0fs", duid, P2P_WARM_IDLE)
 
 
 class _P2PSlot:
-    """Kontextmanager: exklusiver Zugriff aufs Geraet + Mindestabstand."""
+    """Kontextmanager: exklusiver Zugriff aufs Geraet + Mindestabstand.
 
-    def __init__(self, purpose: str) -> None:
+    Der Slot besitzt die Sitzung: er reicht eine noch offene Sitzung des
+    vorherigen Kommandos herein (``transport``) und nimmt sie am Ende wieder
+    entgegen -- um sie warm zu halten (``keep_warm``) oder zu schliessen.
+    """
+
+    def __init__(
+        self,
+        purpose: str,
+        duid: str,
+        signature: _Signature | None = None,
+        reuse: bool = False,
+    ) -> None:
         """Name the kind of session, so the log says who is holding the slot."""
         self._purpose = purpose
+        self._duid = duid
+        self._signature = signature
+        self._reuse = reuse
+        self.transport: _P2PTransport | None = None
+        self.keep_warm = False
 
     def __enter__(self) -> _P2PSlot:
         started = time.monotonic()
@@ -154,7 +289,16 @@ class _P2PSlot:
             _LOGGER.info(
                 "%s waited %.0fs for another P2P session to finish", self._purpose, blocked
             )
-        wait = P2P_MIN_GAP - (time.monotonic() - _P2P_LAST_END)
+        self.transport = _take_warm(self._duid if self._reuse else None, self._signature)
+        if self.transport is not None:
+            # Die Sitzung steht bereits -- weder Handshake noch Erholungsabstand.
+            _LOGGER.debug("%s reuses the open P2P session with %s", self._purpose, self._duid)
+            return self
+        # Ohne Eintrag ist die Station nachweislich frei -- der Vorgabewert muss
+        # den Abstand daher immer als erfuellt ausweisen, auch kurz nach dem Start
+        # des Hosts, wo time.monotonic() noch kleiner als P2P_MIN_GAP sein kann.
+        last_end = _P2P_LAST_END.get(self._duid, time.monotonic() - P2P_MIN_GAP)
+        wait = P2P_MIN_GAP - (time.monotonic() - last_end)
         if wait > 0:
             _LOGGER.debug(
                 "%s waits another %.1fs so the station can recover", self._purpose, wait
@@ -162,9 +306,24 @@ class _P2PSlot:
             time.sleep(wait)
         return self
 
+    def drop_transport(self) -> None:
+        """Close the session held here -- it turned out to be unusable."""
+        transport = self.transport
+        self.transport = None
+        self.keep_warm = False
+        if transport is not None:
+            transport.close()
+            _mark_session_end(self._duid)
+
     def __exit__(self, *exc: object) -> None:
-        global _P2P_LAST_END  # noqa: PLW0603 -- ein Slot, ein Prozess-Zustand
-        _P2P_LAST_END = time.monotonic()
+        transport = self.transport
+        self.transport = None
+        if transport is not None and self.keep_warm and exc[0] is None:
+            _store_warm(self._duid, transport, self._signature)
+        else:
+            if transport is not None:
+                transport.close()
+            _mark_session_end(self._duid)
         _P2P_GATE.release()
 
 
@@ -533,6 +692,34 @@ def _mst_query(client_id: str) -> str:
         conn.close()
 
 
+# Antworten des Discovery-Dienstes je client-id, siehe DISCOVERY_TTL.
+_DISCOVERY_CACHE: dict[str, tuple[float, str]] = {}
+_DISCOVERY_LOCK = threading.Lock()
+
+
+def _mst_query_cached(client_id: str) -> str:
+    """Return the discovery answer, reusing a recent one.
+
+    Saves a TLS handshake and a round trip to global.qvcloud.net on every single
+    session -- half a second that the user waits in front of the door for
+    addresses that have not changed since the last unlock.
+    """
+    with _DISCOVERY_LOCK:
+        cached = _DISCOVERY_CACHE.get(client_id)
+        if cached and time.monotonic() - cached[0] < DISCOVERY_TTL:
+            return cached[1]
+    answer = _mst_query(client_id)
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE[client_id] = (time.monotonic(), answer)
+    return answer
+
+
+def _discovery_forget(client_id: str) -> None:
+    """Drop a cached discovery answer that turned out to be unusable."""
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE.pop(client_id, None)
+
+
 def _parse_param(param: str) -> dict[str, str]:
     """Parse a ``key=value&key=value`` parameter string."""
     out = {}
@@ -607,9 +794,14 @@ class CloudP2PSession:
         The signalling server ignores a ``p2pconnect`` from a client it has not
         acked a ``register`` for, so callers must not skip ahead.
         """
-        servers = _parse_servers(_mst_query(self.client_id))
+        try:
+            servers = _parse_servers(_mst_query_cached(self.client_id))
+        except ET.ParseError:
+            _discovery_forget(self.client_id)
+            raise
         p2p = servers.get("p2papp")
         if not p2p or ":" not in p2p["url"]:
+            _discovery_forget(self.client_id)
             raise P2PError("Discovery lieferte keinen p2papp-Server")
         host = p2p["url"].replace("mqtts://", "").split(":")[0]
         port = int(p2p["url"].rsplit(":", 1)[1])
@@ -622,6 +814,7 @@ class CloudP2PSession:
             username = decode_cred(self.client_id, params["username"])
             password = decode_cred(self.client_id, params["password"])
         except KeyError as err:
+            _discovery_forget(self.client_id)
             raise P2PError("Discovery lieferte keine MQTT-Zugangsdaten") from err
 
         self.cli = self._new_client()
@@ -812,6 +1005,19 @@ class _P2PTransport:
         self.logged_in = threading.Event()      # CH0-LOGIN transportseitig quittiert
         self.device_ready = threading.Event()   # App-Session frei (0xFE msg13=2)
 
+    @property
+    def duid(self) -> str:
+        """Return the device this session belongs to."""
+        return self._duid
+
+    def set_media_sink(self, on_media: Callable[[int, bytes], None] | None) -> None:
+        """Redirect -- or switch off -- the media callback of a running session.
+
+        A session handed on to another command must stop feeding the previous
+        command's assembler, otherwise it keeps buffering video nobody reads.
+        """
+        self._on_media = on_media
+
     # ------------------------------------------------------------- Aufbau
 
     def connect(self) -> bool:
@@ -831,9 +1037,28 @@ class _P2PTransport:
         sock.bind(("0.0.0.0", 0))
         sock.settimeout(RX_POLL_TIMEOUT)
         self._sock = sock
-
-        public_ip, public_port = _natcheck_query(sock)
         local_port = sock.getsockname()[1]
+
+        # NAT-Check und Cloud-Signalisierung haengen nicht voneinander ab und
+        # kosten jeweils bis zu ein paar Sekunden. Nebeneinander gestartet zahlt
+        # der Nutzer vor der Tuer nur die laengere der beiden Wartezeiten. Der
+        # Empfangs-Thread laeuft noch nicht, der Socket gehoert also solange
+        # allein dem NAT-Check.
+        natcheck: list[tuple[str, int]] = []
+        nat_thread = threading.Thread(
+            target=self._natcheck_worker, args=(sock, natcheck),
+            name=f"balter-p2p-nat-{self._duid}", daemon=True,
+        )
+        nat_thread.start()
+
+        cloud = CloudP2PSession(self._client_id, self._duid)
+        self._cloud = cloud
+        cloud.connect()
+        cloud.request_addresses()
+        relay = cloud.wait_for_relay(RELAY_TIMEOUT)
+
+        nat_thread.join(timeout=NATCHECK_TIMEOUT * 5 + 1.0)
+        public_ip, public_port = natcheck[0] if natcheck else ("0.0.0.0", 0)
         if public_port:
             _LOGGER.debug(
                 "NAT check resolved public address %s:%d (local port %d)",
@@ -842,11 +1067,6 @@ class _P2PTransport:
         else:
             _LOGGER.debug("NAT check got no answer -- relying on the cloud relay")
 
-        cloud = CloudP2PSession(self._client_id, self._duid)
-        self._cloud = cloud
-        cloud.connect()
-        cloud.request_addresses()
-        relay = cloud.wait_for_relay(RELAY_TIMEOUT)
         if relay is None:
             _LOGGER.error(
                 "P2P relay discovery timed out for %s (device offline, or a previous "
@@ -875,6 +1095,12 @@ class _P2PTransport:
             return False
         self._send_hello()
         return True
+
+    @staticmethod
+    def _natcheck_worker(sock: socket.socket, out: list[tuple[str, int]]) -> None:
+        """Run the NAT check in a side thread, tolerating a socket closed under it."""
+        with contextlib.suppress(OSError):
+            out.append(_natcheck_query(sock))
 
     def _punch(self, relay: tuple[str, int]) -> bool:
         """Hole-punch until the device answers on both channels."""
@@ -1357,6 +1583,7 @@ class UnlockResult:
 
 
 def _open_door(
+    slot: _P2PSlot,
     duid: str,
     dynamic_password: str,
     pin: str,
@@ -1364,10 +1591,15 @@ def _open_door(
     oem: str = DEFAULT_OEM,
     door: int = 0,
     locknumber: int = 0,
-    data_encode_key: str | None = None,
+    key: bytes = FALLBACK_KEY,
     pin_sha256: str | None = None,
 ) -> UnlockResult:
     """Unlock one door-release relay over UDP/KCP (verified flow).
+
+    ``slot`` owns the session. It hands in a session that is still open from a
+    previous command -- then the unlock is just one frame and takes milliseconds
+    instead of the five to eight seconds a fresh handshake costs -- and takes the
+    session back afterwards, to keep it warm or to close it.
 
     ``pin_sha256`` short-circuits hashing the PIN: the cloud device list already
     carries the same value as ``out-auth-code`` (verified: SHA256(PIN) ==
@@ -1384,15 +1616,23 @@ def _open_door(
         or (hashlib.sha256(pin.encode("utf-8")).hexdigest() if pin else None)
         or SHA256_OF_EMPTY
     )
-    transport = _P2PTransport(
-        duid, dynamic_password, client_id, _session_key(data_encode_key), oem
-    )
-    try:
+
+    # Ein Zeitbudget fuer die ganze Sitzung: jede Sekunde laenger blockiert
+    # den P2P-Slot der Station fuer den naechsten Versuch.
+    deadline = time.monotonic() + DOOR_SESSION_TIMEOUT
+    transport = slot.transport
+    if transport is not None and not _warm_session_alive(transport, deadline):
+        # Die weitergereichte Sitzung antwortet nicht mehr. Sofort neu aufbauen und
+        # NICHT den Erholungsabstand abwarten: die Station hat die Verbindung ja
+        # selbst schon fallen lassen, sie ist damit frei.
+        slot.drop_transport()
+        transport = None
+
+    if transport is None:
+        transport = _P2PTransport(duid, dynamic_password, client_id, key, oem)
+        slot.transport = transport
         if not transport.connect():
             return result
-
-        # Ein Zeitbudget fuer die ganze Sitzung: jede Sekunde laenger blockiert
-        # den P2P-Slot der Station fuer den naechsten Versuch.
         deadline = time.monotonic() + DOOR_SESSION_TIMEOUT
         if not transport.wait_until(transport.device_ready, deadline):
             # Ohne diese Meldung waere nicht zu sehen, WIE WEIT der Handshake kam --
@@ -1405,26 +1645,25 @@ def _open_door(
                 transport.handshake_states(),
             )
             return result
-        result.ready = True
-
         # Erst die drei Setup-Frames, dann der Tueroeffner -- genau in der
-        # Reihenfolge der echten App.
+        # Reihenfolge der echten App. Auf einer schon laufenden Sitzung entfallen
+        # sie, dort ist der Tueroeffner-Frame das einzige, was noch fehlt.
         transport.send_session_setup()
-        _, end_pos = transport.send_ctrl(
-            5, 0xFE, build_open_payload(door, locknumber, pin_hash), msg13=4
-        )
-        result.sent = True
-        _LOGGER.debug("OPENDOOR sent (door=%d lock=%d), waiting for device ack", door, locknumber)
-        result.acked = _await_opendoor_ack(transport, end_pos, deadline)
-        if result.acked:
-            # Die echte App laesst zwischen Quittung und Sitzungsende ~1,7 s
-            # vergehen. Dem Geraet ebenfalls Zeit lassen, den Befehl auszufuehren,
-            # bevor die Sitzung abgebaut wird.
-            time.sleep(POST_UNLOCK_SETTLE)
-    finally:
-        transport.close()
+
+    result.ready = True
+    _, end_pos = transport.send_ctrl(
+        5, 0xFE, build_open_payload(door, locknumber, pin_hash), msg13=4
+    )
+    result.sent = True
+    _LOGGER.debug("OPENDOOR sent (door=%d lock=%d), waiting for device ack", door, locknumber)
+    result.acked = _await_opendoor_ack(transport, end_pos, deadline)
 
     if result.acked:
+        # Die Sitzung bleibt stehen. Das gibt dem Geraet dieselbe Nachlaufzeit,
+        # die sich auch die echte App nimmt (~1,7 s zwischen Quittung und
+        # Sitzungsende), kostet den Nutzer aber keine Wartezeit mehr -- und das
+        # naechste Oeffnen kommt ohne jeden Neuaufbau aus.
+        slot.keep_warm = True
         _LOGGER.debug("Door unlock confirmed by device")
     elif result.sent:
         _LOGGER.error(
@@ -1434,6 +1673,31 @@ def _open_door(
             transport.channels[CH0].peer_ack, end_pos,
         )
     return result
+
+
+def _warm_session_alive(transport: _P2PTransport, deadline: float) -> bool:
+    """Check a session that was kept open before a command is sent on it.
+
+    One harmless session frame -- the same one the app sends after its login --
+    goes out and we wait for the transport to acknowledge it. Only then is it
+    proven that the station is still listening. The unlock frame itself must not
+    be used for that test: a second attempt would open the door twice.
+    """
+    chan = transport.channels[CH0]
+    try:
+        _, end = transport.send_ctrl(4, 0xFE, b"\x00", msg13=2)
+    except (P2PError, OSError):
+        return False
+    probe_deadline = min(deadline, time.monotonic() + WARM_PROBE_TIMEOUT)
+    while time.monotonic() < probe_deadline:
+        transport.maintain()
+        if chan.peer_ack >= end:
+            return True
+        time.sleep(0.01)
+    _LOGGER.debug(
+        "The session kept open with %s went stale -- reconnecting", transport.duid
+    )
+    return False
 
 
 def _await_opendoor_ack(transport: _P2PTransport, end_pos: int, deadline: float) -> bool:
@@ -1477,9 +1741,10 @@ def _await_opendoor_ack(transport: _P2PTransport, end_pos: int, deadline: float)
 # --- Standbild / Clip --------------------------------------------------------
 
 def _grab_video(
+    slot: _P2PSlot,
     duid: str,
     dynamic_password: str,
-    data_encode_key: str | None = None,
+    key: bytes,
     client_id: str = "",
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
@@ -1492,29 +1757,23 @@ def _grab_video(
 
     ``duration`` is the recording window AFTER the login. The device needs about
     two seconds before it starts pushing video, so anything below ~5 s yields
-    very little material.
+    very little material. The window ends early when someone wants to unlock a
+    door -- that always has priority over a picture.
     """
     if not _require_password(duid, dynamic_password):
         return None
 
-    key = _session_key(data_encode_key)
     assembler = _StreamAssembler()
-    transport = _P2PTransport(
-        duid, dynamic_password, client_id, key, oem, on_media=assembler.add
+    transport = _video_session(
+        slot, duid, dynamic_password, key, client_id, oem, assembler.add
     )
+    if transport is None:
+        slot.drop_transport()
+        return None
     try:
-        if not transport.connect():
-            return None
-        if transport.wait(transport.logged_in, LOGIN_TIMEOUT):
-            # Es gibt kein Play-Kommando: das Geraet sendet den Videostrom von
-            # selbst, sobald der CH0-LOGIN app-seitig akzeptiert ist. Die
-            # Setup-Frames folgen dem Video, sie starten es nicht.
-            transport.send_session_setup()
-        else:
-            _LOGGER.warning("Login not confirmed for %s -- device busy?", duid)
-        transport.run_for(duration)
+        transport.run_for(duration, until=_UNLOCK_WANTED.is_set)
     finally:
-        transport.close()
+        _release_or_hand_over(slot, transport, "snapshot")
 
     _LOGGER.debug("Received %d B of media on CH0 from %s", assembler.total, duid)
     frames = [frame for _, frame in extract_app_frames(assembler.read(flush=True))]
@@ -1596,9 +1855,10 @@ def _count_pictures(h264: bytes) -> int:
 # --- Livestream --------------------------------------------------------------
 
 def _stream_video(
+    slot: _P2PSlot,
     duid: str,
     dynamic_password: str,
-    data_encode_key: str | None = None,
+    key: bytes,
     client_id: str = "",
     oem: str = DEFAULT_OEM,
     duration: float = 90.0,
@@ -1618,11 +1878,7 @@ def _stream_video(
     if not _require_password(duid, dynamic_password):
         return 0
 
-    key = _session_key(data_encode_key)
     assembler = _StreamAssembler()
-    transport = _P2PTransport(
-        duid, dynamic_password, client_id, key, oem, on_media=assembler.add
-    )
     ffmpeg = _start_mjpeg_transcoder()
     if ffmpeg is None:
         return 0
@@ -1635,13 +1891,14 @@ def _stream_video(
         threading.Thread(target=_decrypt_pump, args=(ffmpeg, stop, assembler, key),
                          name=f"balter-decrypt-{duid}", daemon=True),
     ]
+    transport = _video_session(
+        slot, duid, dynamic_password, key, client_id, oem, assembler.add
+    )
+    if transport is None:
+        slot.drop_transport()
+        _stop_ffmpeg(ffmpeg)
+        return 0
     try:
-        if not transport.connect():
-            return 0
-        if not transport.wait(transport.logged_in, LOGIN_TIMEOUT):
-            _LOGGER.warning("Stream login not confirmed for %s -- device busy?", duid)
-        else:
-            transport.send_session_setup()
         for worker in workers:
             worker.start()
 
@@ -1649,11 +1906,68 @@ def _stream_video(
         transport.run_for(duration, until=lambda: _stream_should_end(should_stop))
     finally:
         stop.set()
-        transport.close()
+        _release_or_hand_over(slot, transport, "live stream")
         _stop_ffmpeg(ffmpeg)
 
     _LOGGER.debug("Live stream ended for %s (%d frames)", duid, frames_out[0])
     return frames_out[0]
+
+
+def _video_session(
+    slot: _P2PSlot,
+    duid: str,
+    dynamic_password: str,
+    key: bytes,
+    client_id: str,
+    oem: str,
+    on_media: Callable[[int, bytes], None],
+) -> _P2PTransport | None:
+    """Return a logged-in session for a video command, or None if none came up.
+
+    Reuses a session the slot still holds open from a previous command. Joining
+    a running stream means the first frames arrive mid-picture, but both decoders
+    only start at the next parameter set anyway -- and it saves the whole
+    handshake plus the station's recovery gap.
+    """
+    transport = slot.transport
+    if transport is not None:
+        if _warm_session_alive(transport, time.monotonic() + WARM_PROBE_TIMEOUT):
+            transport.set_media_sink(on_media)
+            transport.send_session_setup()
+            return transport
+        slot.drop_transport()
+
+    transport = _P2PTransport(
+        duid, dynamic_password, client_id, key, oem, on_media=on_media
+    )
+    slot.transport = transport
+    if not transport.connect():
+        return None
+    if transport.wait(transport.logged_in, LOGIN_TIMEOUT):
+        # Es gibt kein Play-Kommando: das Geraet sendet den Videostrom von
+        # selbst, sobald der CH0-LOGIN app-seitig akzeptiert ist. Die
+        # Setup-Frames folgen dem Video, sie starten es nicht.
+        transport.send_session_setup()
+    else:
+        _LOGGER.warning("Login not confirmed for %s -- device busy?", duid)
+    return transport
+
+
+def _release_or_hand_over(slot: _P2PSlot, transport: _P2PTransport, what: str) -> None:
+    """End a camera session -- by handing it to a waiting unlock, or by closing it.
+
+    An unlock that had to interrupt us would otherwise pay for the whole
+    handshake AGAIN, plus the station's recovery gap: half a minute in front of
+    the door for a session that is already logged in and ready to take commands.
+    """
+    # Der Assembler dieses Kommandos wird gleich nicht mehr gelesen -- ohne dies
+    # wuerde die uebergebene Sitzung weiter Video hineinpuffern.
+    transport.set_media_sink(None)
+    if _UNLOCK_WANTED.is_set() and transport.device_ready.is_set():
+        _LOGGER.info("Handing the open P2P session over from the %s to the door unlock", what)
+        slot.keep_warm = True
+        return
+    slot.drop_transport()
 
 
 def _stream_should_end(should_stop: Callable[[], bool] | None) -> bool:
@@ -1770,24 +2084,56 @@ def _decrypt_pump(
 
 # --- Öffentliche, serialisierte Einstiegspunkte ------------------------------
 
-def p2p_open_door_sync(*args: Any, **kwargs: Any) -> UnlockResult:
+def p2p_open_door_sync(
+    duid: str,
+    dynamic_password: str,
+    pin: str,
+    client_id: str = "",
+    oem: str = DEFAULT_OEM,
+    door: int = 0,
+    locknumber: int = 0,
+    data_encode_key: str | None = None,
+    pin_sha256: str | None = None,
+) -> UnlockResult:
     """Tueroeffnen -- serialisiert gegen jede andere P2P-Sitzung dieses Prozesses.
 
-    Setzt vorher das Vorrangsignal, damit ein laufender Livestream den Slot
-    sofort raeumt, statt ihn bis zu STREAM_DURATION Sekunden zu blockieren.
+    Setzt vorher das Vorrangsignal, damit Livestream und Standbild den Slot
+    sofort raeumen, statt ihn bis zu STREAM_DURATION Sekunden zu blockieren --
+    und uebernimmt deren bereits eingeloggte Sitzung gleich mit. Ebenso wird eine
+    vom vorherigen Oeffnen noch offene Sitzung wiederverwendet: genau das macht
+    das zweite Oeffnen kurz nach dem ersten so schnell wie in der echten App.
     """
     _UNLOCK_WANTED.set()
+    key = _session_key(data_encode_key)
     try:
-        with _P2PSlot("Door unlock"):
-            return _open_door(*args, **kwargs)
+        with _P2PSlot(
+            "Door unlock", duid, (dynamic_password, client_id, oem, key), reuse=True
+        ) as slot:
+            return _open_door(
+                slot, duid, dynamic_password, pin, client_id, oem, door, locknumber,
+                key, pin_sha256,
+            )
     finally:
         _UNLOCK_WANTED.clear()
 
 
-def p2p_get_snapshot_sync(*args: Any, **kwargs: Any) -> bytes | None:
+def p2p_get_snapshot_sync(
+    duid: str,
+    dynamic_password: str,
+    data_encode_key: str | None = None,
+    client_id: str = "",
+    oem: str = DEFAULT_OEM,
+    duration: float = 8.0,
+    return_h264: bool = False,
+) -> bytes | None:
     """Standbild/Video holen -- serialisiert gegen jede andere P2P-Sitzung."""
-    with _P2PSlot("Snapshot"):
-        return _grab_video(*args, **kwargs)
+    key = _session_key(data_encode_key)
+    with _P2PSlot(
+        "Snapshot", duid, (dynamic_password, client_id, oem, key), reuse=True
+    ) as slot:
+        return _grab_video(
+            slot, duid, dynamic_password, key, client_id, oem, duration, return_h264
+        )
 
 
 def p2p_record_clip_sync(*args: Any, **kwargs: Any) -> bytes | None:
@@ -1795,10 +2141,24 @@ def p2p_record_clip_sync(*args: Any, **kwargs: Any) -> bytes | None:
     return _record_clip(*args, **kwargs)
 
 
-def p2p_stream_video_sync(*args: Any, **kwargs: Any) -> int:
+def p2p_stream_video_sync(
+    duid: str,
+    dynamic_password: str,
+    data_encode_key: str | None = None,
+    client_id: str = "",
+    oem: str = DEFAULT_OEM,
+    duration: float = 90.0,
+    on_jpeg: Callable[[bytes], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> int:
     """Live-Videostream -- serialisiert gegen jede andere P2P-Sitzung."""
-    with _P2PSlot("Live stream"):
-        return _stream_video(*args, **kwargs)
+    key = _session_key(data_encode_key)
+    with _P2PSlot(
+        "Live stream", duid, (dynamic_password, client_id, oem, key), reuse=True
+    ) as slot:
+        return _stream_video(
+            slot, duid, dynamic_password, key, client_id, oem, duration, on_jpeg, should_stop,
+        )
 
 
 # --- Async-Fassaden für Home Assistant ---------------------------------------
@@ -1817,14 +2177,19 @@ async def async_p2p_open_door(
 ) -> bool:
     """Unlock a door without blocking the event loop.
 
-    Deliberately makes exactly ONE handshake attempt per call. Live captures show
-    the door station serves only a single P2P session and needs time to recover:
-    every fresh attempt made while it is still busy *extends* the busy period, so
-    hammering it with internal retries lowers the success rate instead of raising
-    it. One clean attempt, then -- if the handshake stalled before the command
-    left the client -- we raise P2PDoorBusyError so the UI can ask the user to
-    wait ~30 s. If OPENDOOR did go out but was not acknowledged, that is a real
-    failure (returned as False); a retry could open the door twice.
+    Reuses a session that is still open from the previous command whenever there
+    is one, so unlocking twice in a row costs one frame instead of a whole
+    handshake -- the same reason it feels instant in the official app.
+
+    A handshake, when one is needed, is deliberately attempted exactly ONCE per
+    call. Live captures show the door station serves only a single P2P session
+    and needs time to recover: every fresh attempt made while it is still busy
+    *extends* the busy period, so hammering it with internal retries lowers the
+    success rate instead of raising it. One clean attempt, then -- if the
+    handshake stalled before the command left the client -- we raise
+    P2PDoorBusyError so the UI can ask the user to wait ~30 s. If OPENDOOR did go
+    out but was not acknowledged, that is a real failure (returned as False); a
+    retry could open the door twice.
     """
     result = await hass.async_add_executor_job(
         functools.partial(

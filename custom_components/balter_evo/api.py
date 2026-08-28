@@ -1,6 +1,7 @@
 """Quvii Cloud HTTP API client for Balter EVO door stations."""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -21,6 +22,7 @@ from .const import (
     CLIENT_TYPE,
     CLIENT_VERSION,
     CREDENTIAL_MAX_AGE,
+    CREDENTIAL_STALE_AGE,
     DISCOVERY_HOST,
     DISCOVERY_PATH,
     HOST,
@@ -94,6 +96,9 @@ class BalterCloudClient:
         self._server_session: str | None = None
         # duid -> (abgerufen_um, {dynamic_password, data_encode_key, out_auth_code})
         self._cred_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        # Laeuft eine Hintergrundauffrischung, haelt diese Referenz sie am Leben --
+        # asyncio sammelt sonst nicht referenzierte Tasks unter Umstaenden ein.
+        self._refresh_task: asyncio.Task[None] | None = None
 
     @property
     def client_id(self) -> str:
@@ -502,7 +507,7 @@ class BalterCloudClient:
     # --------------------------------------------------------------- helpers
 
     async def get_device_credentials(
-        self, duid: str, max_age: float = CREDENTIAL_MAX_AGE
+        self, duid: str, max_age: float = CREDENTIAL_MAX_AGE, *, allow_stale: bool = False
     ) -> dict[str, str]:
         """Return the rotating per-device secrets, refreshed from the cloud.
 
@@ -511,6 +516,12 @@ class BalterCloudClient:
         Reading them once at setup is therefore not enough. Results are cached
         for ``max_age`` seconds so a burst of snapshots does not hammer the API.
 
+        ``allow_stale`` hands back a cached pair up to ``CREDENTIAL_STALE_AGE``
+        old immediately and refreshes it in the background instead. Callers on a
+        latency-critical path -- opening a door -- want that: the secrets rotate
+        weekly, so a few hours are irrelevant, while a slow or unreachable cloud
+        would otherwise delay the unlock by seconds for nothing.
+
         Returns ``{"dynamic_password", "data_encode_key", "out_auth_code"}``;
         values may be empty strings if the cloud is unreachable and nothing was
         cached earlier. Callers must treat an empty ``dynamic_password`` as a
@@ -518,6 +529,9 @@ class BalterCloudClient:
         """
         cached = self._cred_cache.get(duid)
         if cached and (time.time() - cached[0]) < max_age:
+            return cached[1]
+        if allow_stale and cached and (time.time() - cached[0]) < CREDENTIAL_STALE_AGE:
+            self._refresh_credentials_soon()
             return cached[1]
 
         try:
@@ -542,6 +556,25 @@ class BalterCloudClient:
             )
             return {"dynamic_password": "", "data_encode_key": "", "out_auth_code": ""}
         return refreshed[1]
+
+    def _refresh_credentials_soon(self) -> None:
+        """Refresh the cached device secrets in the background, one run at a time."""
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._refresh_task = loop.create_task(self._refresh_credentials())
+
+    async def _refresh_credentials(self) -> None:
+        """Pull a fresh device list; a temporarily unreachable cloud is not fatal."""
+        try:
+            await self.get_device_list()
+        except BalterApiError as err:
+            # Der Aufrufer arbeitet bereits mit dem zwischengespeicherten Paar
+            # weiter -- hier ist nichts zu retten und nichts zu melden.
+            _LOGGER.debug("Background credential refresh failed: %s", err)
 
     async def get_dynamic_password(self, duid: str) -> str:
         """Return the current rotating device password, or "" if unavailable.

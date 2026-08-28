@@ -70,7 +70,11 @@ class BalterDoorLock(LockEntity):
         try:
             # dynamic_password und data_encode_key rotieren woechentlich -- immer
             # frisch holen (gecacht), nie die Werte vom Setup-Zeitpunkt benutzen.
-            creds = await self._client.get_device_credentials(duid)
+            # allow_stale: vor der Tuer darf eine langsame oder gestoerte
+            # Cloud-Verbindung das Oeffnen nicht aufhalten. Ein Paar von heute
+            # morgen ist bei woechentlicher Rotation praktisch immer gueltig; die
+            # Auffrischung laeuft dann im Hintergrund weiter.
+            creds = await self._client.get_device_credentials(duid, allow_stale=True)
 
             # Ohne gueltiges Geraetepasswort gar nicht erst aufbauen: die
             # Tuerstation quittiert einen solchen LOGIN transportseitig und

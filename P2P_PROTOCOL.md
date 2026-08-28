@@ -530,12 +530,32 @@ konsequent den unbrauchbaren Kandidaten, obwohl der richtige danebenlag.
 Auswahlkriterium ist jetzt: erster Kandidat, der **SPS und IDR** enthält
 (Kandidaten stehen in Prioritätsreihenfolge, Cloud-Key zuerst).
 
-### 10.3 Wiederverbindungs-Cooldown
+### 10.3 Wiederverbindungs-Cooldown — und wie die App ihn umgeht
 
 Zwei Läufe kurz hintereinander → der zweite bleibt im Handshake stehen (das Gerät
 hält die alte Session, `p2pconnect` liefert kein Relay oder der a9 wird nicht mehr
-quittiert). Zwischen Läufen ~60–90 s Abstand lassen. Ungelöst; für HA relevant,
-wenn Snapshot und Türöffnen kurz nacheinander angefordert werden.
+quittiert). Zwischen Läufen ~60–90 s Abstand lassen.
+
+Die offizielle App hat dieses Problem nicht, weil sie gar nicht neu verbindet: In
+`live_real.pcap` (§9.1) steht **eine** Sitzung, in der Video läuft und der
+Türöffner erst bei t=37,3 s gedrückt wird. Ein zweiter Druck wäre ein weiterer
+`0xFE msg13=4` in derselben Sitzung gewesen — ohne NAT-Check, ohne Discovery, ohne
+MQTT, ohne Punch, ohne LOGIN, ohne Cooldown.
+
+Die Integration macht es seit 2026-08-28 genauso: Nach einem quittierten Öffnen
+bleibt die Sitzung `P2P_WARM_IDLE` Sekunden stehen (Keepalive-Thread, der nur
+`maintain()` weiterlaufen lässt) und bedient das nächste Kommando sofort. Vor
+jedem Kommando auf einer solchen Sitzung geht ein harmloser Setup-Frame
+(`0xFE msg13=2`) raus; erst wenn dessen Transport-Quittung kommt, ist bewiesen,
+dass das Gerät noch zuhört. Der Öffner-Frame selbst taugt dafür nicht — ein
+zweiter Versuch würde die Tür zweimal öffnen. Läuft die Zeit ab, wird sauber
+geschlossen und der Cooldown gilt wieder; Klingel und App bekommen den einzigen
+Slot der Station also nach spätestens `P2P_WARM_IDLE` zurück.
+
+Aus demselben Grund reicht ein laufender Snapshot oder Livestream seine bereits
+eingeloggte Sitzung an ein wartendes Türöffnen weiter, statt sie zu schließen:
+sonst zahlt genau der Fall „es klingelt, Bild anschauen, öffnen" den vollen
+Handshake **plus** Cooldown.
 
 ### 10.4 Türöffnen: drei Fehler, die den Befehl wirkungslos machten
 
