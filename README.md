@@ -18,7 +18,6 @@ Sie öffnet die Tür, liefert das Kamerabild und einen Livestream — der Öffne
 
 | Entität | Was sie tut |
 |---|---|
-| `button.*` — eine je Türstation | **Live-Bild (90 s)** — startet eine begrenzte Live-Sitzung. Der ausdrückliche „ich will jetzt schauen"-Auslöser; danach ist die Station wieder frei. |
 | `lock.*` — ein Eintrag je Türöffner-Relais | Öffnet die Tür. Als Erfolg gilt erst die **Empfangsbestätigung der Türstation**, nicht das bloße Absenden. Danach fällt die Anzeige nach 8 s optisch wieder zu (das Relais ist ohnehin ein Taster). |
 | `camera.*` — eine je Türstation | Standbild auf Abruf (60 s zwischengespeichert) und auf Wunsch ein echter Livestream (~11 fps MJPEG). |
 | `balter_evo.record_clip` | Nimmt einen kurzen MP4-Clip der Türstation auf. |
@@ -71,10 +70,8 @@ Es werden nur **E-Mail und Passwort deines Quvii-Cloud-Kontos** abgefragt — di
 
 Außerhalb eines Streams zeigt die Kamera sparsame Einzel-Standbilder mit 60 s Cache. Das ist Absicht: Jedes Bild belegt kurz die einzige P2P-Sitzung der Anlage.
 
-**Livestream starten:** den Button **Live-Bild (90 s)** drücken, die Live-Ansicht der Kamera öffnen **oder** die Entität einschalten (`camera.turn_on`).
+**Livestream starten:** Live-Ansicht der Kamera öffnen **oder** die Entität einschalten (`camera.turn_on`).
 **Stoppen:** Entität ausschalten (`camera.turn_off`) — sonst endet der Stream nach **90 Sekunden** von selbst und gibt die Station wieder frei.
-
-Während einer laufenden Sitzung liefert die Kamera den **unveränderten H.264-Strom an die `stream`-Integration** von Home Assistant (HLS/WebRTC im Browser, ohne Transkodieren). Außerhalb einer Sitzung gibt es bewusst **keine** Stream-Quelle: `stream` und go2rtc öffnen Quellen von sich aus und halten sie offen — mit einer dauerhaft verfügbaren URL würden sie den einzigen P2P-Slot der Station belegen und Klingel wie Handy-App aussperren. Wann eine Sitzung läuft, entscheidet also allein der Button (oder `camera.turn_on`).
 
 > Der Stream beginnt rund 8–10 s nach dem Öffnen: erst der P2P-Handshake, dann sendet das Gerät selbst noch etwa zwei Sekunden nichts.
 
@@ -143,7 +140,6 @@ logger:
 | Tür geht auf, HA meldet trotzdem einen Fehler | Sollte seit v0.9.0 nicht mehr vorkommen. Mit Debug-Log melden. |
 | Öffnen wird angenommen, aber nichts passiert | Meist eine eingetragene Tür-PIN, die nicht zum Gerät passt. Feld leer lassen. Das Log warnt in diesem Fall. |
 | Kein Kamerabild, Türöffnen geht | `ffmpeg` fehlt auf dem HA-Host. |
-| Bild zerläuft in bunte Blöcke, friert kurz ein | Paketverlust auf dem Weg zur Türstation. Am Ende jedes Streams steht die Verlustrate als Warnung im Log. Meist WLAN-Empfang an der Station. |
 
 ## Entwicklung
 
@@ -152,7 +148,6 @@ Zwei Regressionstests laufen ohne Türstation und ohne Home Assistant:
 ```bash
 python tools/verify_frames.py     # Frame-Format byte-genau gegen einen Mitschnitt (braucht den pcap)
 python tools/verify_sessions.py   # Slot-, Sitzungs- und Öffnen-Logik (22 Prüfungen, ohne Netz)
-python tools/verify_media.py      # Medienkette: MJPEG- und MPEG-TS-Ausgang (braucht ffmpeg)
 ```
 
 `tools/verify_sessions.py` deckt genau die Fälle ab, die sich an echter Hardware kaum provozieren lassen: Übernahme und Ablauf einer offen gehaltenen Sitzung, „genau ein Schliessen" auf jedem Abbauweg, ein verlorenes Prüf-Paket, ein hängender Keepalive-Thread — und dass ein zweites Öffnen wirklich ein neuer Befehl auf einem neuen Byte-Offset ist.
@@ -163,8 +158,8 @@ Die vollständigen Notizen stehen unter [Releases](https://github.com/LucaHerrer
 
 | Version | Kurz |
 |---|---|
-| **0.12.1** | Verlorene Videopakete werden nicht mehr durch Nullbytes ersetzt — das war die Ursache für zerlaufende, minutenlang stehenbleibende Bildfehler. Stattdessen kurzes Einfrieren und sauberes Aufsetzen; der Verlust steht jetzt im Log. |
-| **0.12.0** | Button **Live-Bild (90 s)** je Türstation; der Livestream steht zusätzlich der `stream`-Integration als H.264 zur Verfügung. Behoben: `-fflags nobuffer` legte ab ffmpeg 9 den kompletten Videoweg still lahm. |
+| **0.12.2** | **Nimmt 0.12.0 und 0.12.1 vollständig zurück** — der Code entspricht wieder 0.11.2. In 0.12.x funktionierte das Türöffnen nicht mehr; das ist die Kernfunktion, deshalb der Rückbau statt einer Nachbesserung. Wer 0.12.0 oder 0.12.1 installiert hat, sollte auf diese Version aktualisieren. Live-Bild-Button und H.264-Stream sind damit vorerst wieder weg. |
+| **0.12.0**, **0.12.1** | Zurückgezogen — siehe 0.12.2. |
 | **0.11.x** | Haltedauer der Sitzung einstellbar (Standard 10 s, 0 = aus); Robustheit: verlorene Pakete verwerfen die Sitzung nicht mehr, sauberes Aufräumen beim Entladen, Netzfehler zur Cloud werden abgefangen. |
 | **0.10.0** | Sitzung bleibt nach dem Öffnen stehen → **mehrfaches Öffnen hintereinander**, erstes Öffnen deutlich schneller. Kamerasitzungen werden ans Türöffnen weitergereicht. |
 | **0.9.2** | Türöffnen hat Vorrang vor dem Kamerabild; Standbild-Cache auf 60 s. |

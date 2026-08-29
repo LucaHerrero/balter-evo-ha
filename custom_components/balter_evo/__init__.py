@@ -26,7 +26,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LOCK, Platform.CAMERA, Platform.BUTTON]
+PLATFORMS: list[Platform] = [Platform.LOCK, Platform.CAMERA]
 
 HEX16 = re.compile(r"^[0-9a-f]{16}$")
 
@@ -40,10 +40,6 @@ class BalterRuntimeData:
     devices: list[dict[str, Any]] = field(default_factory=list)
     locks: list[dict[str, Any]] = field(default_factory=list)
     warm_idle: float = DEFAULT_WARM_IDLE
-    # Kamera-Entities je duid, damit der Live-Bild-Button seine Kamera findet.
-    # Die Plattformen werden parallel eingerichtet, die Kameras tragen sich
-    # deshalb selbst ein, sobald sie da sind.
-    cameras: dict[str, Any] = field(default_factory=dict)
 
 
 type BalterConfigEntry = ConfigEntry[BalterRuntimeData]

@@ -39,17 +39,6 @@ STREAM_DURATION = 90.0
 # gewartet wird, bevor er hart abgebrochen wird.
 STREAM_STOP_TIMEOUT = 5.0
 
-# Waehrend eines Livestreams wird der unveraenderte H.264-Strom zusaetzlich als
-# MPEG-TS auf einen lokalen UDP-Port geschickt; von dort holt ihn die
-# stream-Integration von Home Assistant ab (HLS/WebRTC statt Einzelbilder).
-# Nur ueber das Loopback-Interface -- der Strom verlaesst den Host nicht.
-STREAM_TS_HOST = "127.0.0.1"
-
-# Leseoptionen der stream-Integration: ein grosser Empfangspuffer gegen Ruckler,
-# und ein Timeout (in Mikrosekunden), damit das Lesen nach dem Ende der Sitzung
-# aufhoert, statt haengen zu bleiben.
-STREAM_TS_INPUT_OPTIONS = "fifo_size=5000000&overrun_nonfatal=1&timeout=8000000"
-
 # Die Tuerstation bedient immer nur EINE P2P-Sitzung und braucht danach Erholung:
 # ein Versuch, der startet, waehrend sie noch belegt ist, verlaengert die Belegung.
 # Snapshot, Livestream und Tueroeffnen teilen sich deshalb einen Slot und halten
