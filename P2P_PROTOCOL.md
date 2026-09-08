@@ -663,3 +663,70 @@ ohne Telefon, ohne App, ohne die Android-SSAID und ohne den `client-login`-Flow.
 
 Die client-id IST die Android-SSAID der App-Installation (siehe §10.5), aber die
 Integration braucht sie nicht: sie erzeugt eine eigene und leitet alles davon ab.
+
+---
+
+## 12. Zeitbudget einer Sitzung — gemessen und gekürzt (2026-09-08)
+
+Grundlage sind Debug-Mitschnitte einer laufenden Home-Assistant-Instanz und
+Messungen gegen die echte Cloud, nicht mehr nur pcaps. Eine Sitzung wurde
+vollständig protokolliert (Standbild, Relay `195.154.119.43`, Gerät
+`146.52.36.168:55318` / LAN `192.168.178.143:55318`):
+
+| Phase | Dauer | Anmerkung |
+|---|---|---|
+| Cloud-Geräteliste (Geheimnisse) | 0,2–1,5 s | mit Zwischenspeicher meist 0 |
+| MQTT-Aufbau + `p2pconnect` | **1,55 s** | davon 0,93 s TCP/TLS/CONNACK/SUBSCRIBE/`register` |
+| Hole-Punch bis HELLO76-Echo | 0,55 s | Antwort ist nach ~60 ms da |
+| a9-Echo | 0,06 s | eine Relay-Rundreise |
+| LOGIN-Quittung | 0,32 s | |
+| Freigabe der App-Sitzung | ~2,0–2,3 s | **geräteseitig**, nicht beeinflussbar |
+| Standbild-Fenster | 8,0 s fest | zum Bild werden ~2 s gebraucht |
+
+Vier davon waren Verschwendung, eine ist ein Fehler gewesen:
+
+1. **Die Signalisierung wurde je Sitzung neu aufgebaut.** Gemessen: kalt 1,55 s,
+   auf einer offen gehaltenen Verbindung 0,50–0,60 s — **1,0 s je Sitzung**, live
+   gegen `mqttsr1.qvcloud.net` und das echte Gerät verifiziert. Die App hält
+   diese Verbindung ohnehin dauerhaft offen; die Türstation belegt sie nicht.
+   Wichtig dabei: die Antwort trägt `resp-session-id`, und auf einer
+   wiederverwendeten Verbindung kann noch die verspätete Antwort des vorigen
+   Kommandos eintreffen — sie muss verworfen werden.
+2. **Der NAT-Check lief jedes Mal neu.** Beobachtet ist das NAT port-preserving
+   (`95.90.130.137:45897` bei lokalem Port 45897), die öffentliche Adresse
+   wechselt höchstens täglich. Beides ist aus der letzten Sitzung bekannt.
+3. **Der Hole-Punch schlief 150 ms, bevor er nach der Antwort sah**, die nach
+   ~60 ms da ist. Senderaster bleibt, geprüft wird jetzt im 10-ms-Takt.
+4. **Das Standbild sass sein 8-s-Fenster aus.** SPS und IDR sind gut zwei
+   Sekunden nach dem LOGIN beisammen; alles danach macht das Bild nur älter.
+   Praktisch entscheidend: Home Assistant bricht eine Kamera-Anfrage nach
+   **10 s** ab — mit Fenster kam das Bild nie an (HTTP 500 nach 10,19 s),
+   während die Sitzung noch bis Sekunde 12 weiterlief.
+
+**Der Fehler: die Freigabe wurde übersehen.** Das `0xFE msg13=2` aus §9.1 wurde
+nur in Paketen gesucht, die **mit** einem App-Frame beginnen. Im Mitschnitt der
+laufenden Instanz kam es hinter Videodaten und wurde nicht erkannt — obwohl das
+Gerät unmittelbar danach 140 kB Video schickte. Ein Türöffnen wartet auf genau
+dieses Signal und lief deshalb in sein 20-s-Zeitlimit, an einer Sitzung, die
+längst bereit war. Danach greift der 30-s-Erholungsabstand, der Nutzer drückt
+erneut — im Log der Instanz vergingen so **1:44 min zwischen erstem Druck und
+offener Tür**, bei drei Versuchen. Gesucht wird jetzt an jeder Frame-Grenze
+jedes Pakets. Zusätzlich gilt der laufende Videostrom als zweiter, unabhängiger
+Beweis der Freigabe (§9.2: es gibt kein Start-Kommando, das Gerät sendet erst
+nach der Freigabe von selbst).
+
+### Was NICHT gemacht wurde
+
+**Direkter Punch statt Relay.** Das Gerät nennt in der `p2pconnect`-Antwort
+neben dem Rendezvous auch seine WAN-Adresse, die auf ICMP antwortet (18,5 ms
+gegenüber 23,2 ms zum Relay) und deren Port über mehrere Anfragen stabil bleibt.
+Ein paralleler Punch auf alle Kandidaten — so macht es die App — spart aber nur
+~25 ms je Rundreise, also rund 0,1 s von 4 s, während ein Umschalten auf einen
+Pfad, der nur Punch-Pakete durchlässt, die Sitzung hängen ließe: 20 s Fehlschlag
+plus 30 s Erholung. Für den Videodurchsatz bleibt es trotzdem interessant, dann
+aber mit Rückfall auf den Relay, wenn der direkte Weg verstummt.
+
+**Die ~2 s bis zur Freigabe.** Sie liegen im Gerät. Denkbar wäre, für ein reines
+Türöffnen den a9-SETUP nicht als Video (`[9]=0`) anzukündigen, damit die Station
+keinen Encoder startet — dafür fehlt aber jeder Mitschnitt, und ein Fehlversuch
+kostet an der echten Tür 50 s.
