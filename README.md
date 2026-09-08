@@ -73,7 +73,7 @@ Außerhalb eines Streams zeigt die Kamera sparsame Einzel-Standbilder mit 60 s C
 **Livestream starten:** Live-Ansicht der Kamera öffnen **oder** die Entität einschalten (`camera.turn_on`).
 **Stoppen:** Entität ausschalten (`camera.turn_off`) — sonst endet der Stream nach **90 Sekunden** von selbst und gibt die Station wieder frei.
 
-> Der Stream beginnt rund 5–7 s nach dem Öffnen: erst der P2P-Handshake, dann sendet das Gerät selbst noch etwa zwei Sekunden nichts. Ein Einzelbild ist schneller da — es endet, sobald ein vollständiges Bild angekommen ist, statt ein festes Zeitfenster auszusitzen.
+> Der Stream beginnt rund 5 s nach dem Öffnen: erst der P2P-Handshake, dann sendet das Gerät selbst noch etwa zwei Sekunden nichts. Ein Einzelbild ist schneller da — es endet, sobald ein vollständiges Bild angekommen ist, statt ein festes Zeitfenster auszusitzen.
 
 Ein angefordertes **Türöffnen hat immer Vorrang** und beendet einen laufenden Stream sofort — es übernimmt dessen bereits aufgebaute Verbindung sogar direkt, statt sie wegzuwerfen.
 
@@ -96,7 +96,7 @@ Zwei Eigenschaften der Anlage bestimmen das ganze Verhalten:
 
 **Die Türstation bedient immer nur EINE P2P-Sitzung** — und braucht nach deren Ende 60–90 s Erholung. Ein Versuch, der startet, während sie noch belegt ist, *verlängert* die Belegung. Türöffnen, Standbild und Livestream teilen sich deshalb intern einen Slot mit Mindestabstand, und ein Öffnen verdrängt die anderen beiden.
 
-**Ein Verbindungsaufbau kostet 3–5 Sekunden** (Cloud-Signalisierung, UDP-Hole-Punching, Login, dann rund zwei Sekunden, die das Gerät selbst braucht, bis es die Sitzung freigibt). Genau deshalb hält die Integration die Sitzung nach einem Befehl offen: Das zweite Öffnen ist dann nur noch ein einzelnes Datenpaket und dauert Millisekunden — so, wie es sich auch in der offiziellen App anfühlt.
+**Ein Verbindungsaufbau kostet rund 4 Sekunden** (gemessen: 3,75 s) (Cloud-Signalisierung, UDP-Hole-Punching, Login, dann rund zwei Sekunden, die das Gerät selbst braucht, bis es die Sitzung freigibt). Genau deshalb hält die Integration die Sitzung nach einem Befehl offen: Das zweite Öffnen ist dann nur noch ein einzelnes Datenpaket und dauert Millisekunden — so, wie es sich auch in der offiziellen App anfühlt.
 
 Und aus demselben Grund bleibt auch die **Signalisierungsverbindung zur Cloud** stehen, die der Station sagt, wohin sie punchen soll. Sie belegt die Station nicht, ihr Neuaufbau kostet aber jedes Mal eine gute Sekunde — die offizielle App hält sie ebenfalls dauerhaft offen.
 

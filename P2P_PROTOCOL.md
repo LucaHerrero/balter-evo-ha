@@ -730,3 +730,38 @@ aber mit Rückfall auf den Relay, wenn der direkte Weg verstummt.
 Türöffnen den a9-SETUP nicht als Video (`[9]=0`) anzukündigen, damit die Station
 keinen Encoder startet — dafür fehlt aber jeder Mitschnitt, und ein Fehlversuch
 kostet an der echten Tür 50 s.
+
+### Nachgemessen an der echten Station (v0.13.1, 2026-09-08)
+
+Alle Zeiten aus dem Debug-Log derselben Instanz, mit der oben gemessen wurde.
+
+**Türöffnen, kalt: 3,75 s** (vorher 9,3 s)
+
+| t [s] | Ereignis |
+|---|---|
+| 0,000 | Befehl angenommen |
+| 0,001 | Signalisierung **wiederverwendet** (vorher: 1,55 s Neuaufbau) |
+| 0,584 | `p2pconnect`-Antwort; öffentliche Adresse **aus dem Zwischenspeicher** |
+| 1,169 | HELLO76-Echo |
+| 1,284 | 144B-Echo → LOGIN |
+| 1,571 | LOGIN quittiert |
+| 3,606 | `0xFE msg13=2` — Freigabe (2,04 s, geräteseitig) |
+| 3,671 | OPENDOOR gesendet |
+| 3,752 | quittiert, Tür offen |
+
+**Standbild: 5,2 s** über `/api/camera_proxy` (352×280, 9,9 kB) — vorher kam über
+diesen Weg **überhaupt kein Bild**, siehe unten. Das Medienfenster betrug 2,6 s
+statt der festen 8 s; das vollständige Bild lag 0,19 s nach dem ersten
+Videopaket vor. Über `camera.snapshot`: 7,2 s statt Abbruch nach 10,19 s.
+
+**Beide Wege zur Freigabe live bestätigt:** beim Türöffnen (kein Video im
+Vorlauf) kam das `0xFE msg13=2` am Paketanfang und wurde erkannt; bei beiden
+Standbildern wurde es erneut *nicht* gefunden, und der Videostrom hat die
+Freigabe bewiesen (`Video is flowing on CH1000000`). Ohne diesen zweiten Beweis
+hätte ein Türöffnen in derselben Lage wieder ins Zeitlimit laufen können.
+
+**Nebenbefund, unabhängig vom Protokoll:** Home Assistant weist jede Anfrage an
+`/api/camera_proxy` mit **503** ab, wenn die Kamera-Entität `is_on=False`
+meldet — die Entität wird dabei nicht gefragt. War `is_on` an den Livestream
+gekoppelt, blieb also jede Dashboard-Karte leer, solange kein Stream lief.
+Behoben in v0.13.1.
