@@ -1899,6 +1899,19 @@ def _open_door(
         if not transport.connect():
             return result
         deadline = time.monotonic() + DOOR_SESSION_TIMEOUT
+        if not transport.wait(transport.logged_in, LOGIN_TIMEOUT):
+            # Eine Station, die Punch, HELLO und a9 beantwortet, dann aber die
+            # LOGIN-Bytes nicht quittiert, haelt noch ihre vorige Sitzung fest.
+            # Daran aendert sich im restlichen Zeitbudget nichts mehr -- also
+            # gleich aufgeben und ihr die Erholungszeit lassen, statt sie noch
+            # zwoelf Sekunden laenger zu belegen und den naechsten Versuch des
+            # Nutzers genauso weit nach hinten zu schieben.
+            _LOGGER.error(
+                "The station did not acknowledge the LOGIN within %.0fs -- it is still "
+                "holding an earlier session. OPENDOOR was not sent. Handshake got to %s.",
+                LOGIN_TIMEOUT, transport.handshake_states(),
+            )
+            return result
         if not transport.wait_until(transport.device_ready, deadline):
             # Ohne diese Meldung waere nicht zu sehen, WIE WEIT der Handshake kam --
             # genau das unterscheidet "Station belegt" von einem echten Fehler.

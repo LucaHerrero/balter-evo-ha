@@ -153,6 +153,10 @@ class FakeStation(FakeTransport):
         """Report the event state without waiting."""
         return event.is_set()
 
+    def wait(self, event, timeout) -> bool:
+        """Report the event state without waiting."""
+        return event.is_set()
+
     def handshake_states(self) -> str:
         """Return a handshake summary for error logs."""
         return "CH1000000=LOGGED_IN"

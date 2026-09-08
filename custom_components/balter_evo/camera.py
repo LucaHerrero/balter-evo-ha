@@ -108,8 +108,20 @@ class BalterDoorbellCamera(Camera):
 
     @property
     def is_on(self) -> bool:
-        """Camera 'on' == a live stream is currently running."""
-        return self._streaming
+        """Report that the camera is available -- it always is.
+
+        This must NOT be tied to the live stream. Home Assistant refuses to
+        serve any image of a camera whose ``is_on`` is False: the image proxy
+        answers 503 before the entity is ever asked. Tied to the stream, that
+        meant every dashboard card and every snapshot URL stayed empty whenever
+        no stream was running -- which is the normal state, and exactly the one
+        in which this camera has a still image to offer.
+
+        Whether a stream is running is :attr:`is_streaming`; that is what the
+        entity state ("streaming" vs "idle") shows, and ``turn_on`` / ``turn_off``
+        keep starting and stopping it.
+        """
+        return True
 
     @property
     def is_streaming(self) -> bool:
