@@ -102,12 +102,22 @@ RX_POLL_TIMEOUT = 0.15
 # Zeitbudgets einer Sitzung. Jede Sekunde laenger blockiert den einzigen
 # P2P-Slot der Station fuer alle anderen (Klingel, App, Tueroeffner).
 RELAY_TIMEOUT = 10.0
+# Auf einer schon offenen Signalisierung ist die p2pconnect-Antwort ein einziger
+# Umlauf ueber den Broker und in unter einer Sekunde da. Bleibt sie laenger aus,
+# ist die Verbindung tot -- dann lieber frueh neu aufbauen, als das volle
+# Zeitbudget stumm abzuwarten.
+SIGNALLING_REUSE_TIMEOUT = 5.0
 PUNCH_TIMEOUT = 15.0
 LOGIN_TIMEOUT = 8.0
 DOOR_SESSION_TIMEOUT = 20.0
 OPENDOOR_MAX_SENDS = 3
 OPENDOOR_RESEND_AFTER = 1.2
 CLOSE_LINGER = 0.3
+
+# Ab so vielen Nutzbytes nach dem LOGIN ist klar, dass der Videostrom laeuft --
+# und damit, dass das Geraet die App-Sitzung freigegeben hat. Steuernachrichten
+# allein kommen nie in diese Groessenordnung.
+STREAM_IS_PROOF = 4096
 
 # Die echte App laesst zwischen Quittung und Sitzungsende ~1,7 s vergehen. Bleibt
 # die Sitzung ohnehin offen, ergibt sich diese Nachlaufzeit von selbst -- wird sie
@@ -166,6 +176,15 @@ _UNLOCK_WANTED = threading.Event()
 # Nach einem Kommando offen gehaltene Sitzungen, je Geraet hoechstens eine.
 _WARM: dict[str, _WarmSession] = {}
 _WARM_LOCK = threading.Lock()
+
+# Die Cloud-Signalisierung je client-id. Sie sagt der Station nur, wohin sie
+# punchen soll -- die Station selbst belegt sie NICHT, anders als die P2P-Sitzung.
+# Zwischen zwei Kommandos aendert sich an ihr nichts: derselbe Broker, dieselbe
+# Anmeldung. Sie jedes Mal neu aufzubauen kostet TCP, TLS, CONNACK, SUBSCRIBE und
+# die register-Quittung -- rund eine Sekunde, die der Nutzer vor der Tuer wartet.
+# Die echte App haelt diese Verbindung ebenfalls dauerhaft offen.
+_SIGNALLING: dict[str, CloudP2PSession] = {}
+_SIGNALLING_LOCK = threading.Lock()
 
 # Was eine Sitzung wiederverwendbar macht: dieselben Geheimnisse, dieselbe
 # Identitaet. Rotiert die Cloud den Schluessel, passt die Signatur nicht mehr und
@@ -296,9 +315,15 @@ def release_all_sessions() -> None:
 
     Called when the integration unloads: the keepalive threads are daemons and
     would otherwise keep pinging -- and keep the station busy for the doorbell
-    and the phone app -- until their hold time runs out.
+    and the phone app -- until their hold time runs out. The signalling links to
+    the cloud go with them; nothing is left running behind an unloaded entry.
     """
     _take_warm(None, None)
+    with _SIGNALLING_LOCK:
+        links = list(_SIGNALLING.values())
+        _SIGNALLING.clear()
+    for link in links:
+        link.shutdown()
 
 
 def _store_warm(
@@ -716,6 +741,42 @@ def _natcheck_query(sock: socket.socket, tries: int = 5) -> tuple[str, int]:
     return "0.0.0.0", 0
 
 
+# Was der NAT-Check ueber diesen Anschluss ergeben hat: die oeffentliche Adresse
+# und ob der Router den Quellport beibehaelt. Die oeffentliche Adresse eines
+# Hausanschlusses wechselt hoechstens taeglich, die Port-Eigenschaft gar nicht --
+# beides jedes Mal neu zu erfragen kostet einen Umlauf zum Anbieter-Server und
+# bei Paketverlust bis zu drei Sekunden, in denen die Sitzung stillsteht.
+_NAT_CACHE: tuple[float, str] | None = None
+_NAT_CACHE_TTL = 600.0
+_NAT_LOCK = threading.Lock()
+
+
+def _nat_cached() -> str | None:
+    """Return the public IP if it is known and the port can be predicted."""
+    with _NAT_LOCK:
+        if _NAT_CACHE is None or time.monotonic() - _NAT_CACHE[0] > _NAT_CACHE_TTL:
+            return None
+        return _NAT_CACHE[1]
+
+
+def _nat_remember(public_ip: str, port_preserving: bool) -> None:
+    """Note the NAT check result -- but only a router that keeps the source port.
+
+    Without port preservation the public port belongs to that one socket and
+    says nothing about the next session's, so there is nothing worth keeping.
+    """
+    global _NAT_CACHE
+    with _NAT_LOCK:
+        _NAT_CACHE = (time.monotonic(), public_ip) if port_preserving else None
+
+
+def _nat_forget() -> None:
+    """Drop the cached public address -- it did not get us a connection."""
+    global _NAT_CACHE
+    with _NAT_LOCK:
+        _NAT_CACHE = None
+
+
 def _local_ip_towards(peer_ip: str) -> str:
     """Return the LAN address this host would use to reach ``peer_ip``.
 
@@ -847,6 +908,46 @@ class CloudP2PSession:
         self.cli: mqtt.Client | None = None
         self._sub = f"{self.client_id}/ust/json"
         self._pub = f"app/ust/json/{self.client_id}"
+
+    @classmethod
+    def acquire(cls, client_id: str, duid: str) -> tuple[CloudP2PSession, bool]:
+        """Return a registered signalling session and whether it was already open.
+
+        Only the per-command fields are renewed; broker connection, TLS session
+        and registration survive -- the second and a half that a cold unlock used
+        to spend before it even knew where to punch. Callers are told whether the
+        link is a reused one, because that one may have died unnoticed and is
+        worth one quick retry rather than the full timeout.
+        """
+        with _SIGNALLING_LOCK:
+            link = _SIGNALLING.get(client_id)
+            if link is not None and link.usable():
+                link.restart(duid)
+                return link, True
+            _SIGNALLING.pop(client_id, None)
+        if link is not None:
+            # Verbindung ist weg (Broker-Timeout, Netzwechsel) -- sauber abraeumen,
+            # damit kein halb toter paho-Thread stehen bleibt.
+            link.shutdown()
+        link = cls(client_id, duid)
+        link.connect()
+        with _SIGNALLING_LOCK:
+            _SIGNALLING[client_id] = link
+        return link, False
+
+    def usable(self) -> bool:
+        """Report whether this link is connected and registered right now."""
+        cli = self.cli
+        return bool(cli is not None and cli.is_connected() and self.registered.is_set())
+
+    def restart(self, duid: str) -> None:
+        """Aim the open link at the next command: new token, new request id."""
+        self.duid = duid
+        self.session_flag = rand_token(43)
+        self.requ_id = random.randint(-(2**31), -1)
+        self.loc = self.pub = self.relay = None
+        self.got_addr.clear()
+        _LOGGER.debug("Reusing the open signalling link for %s", duid)
 
     def _hdr(self, cmd: str) -> dict[str, Any]:
         return {
@@ -998,6 +1099,14 @@ class CloudP2PSession:
             self._read_addresses(payload.get("content", {}))
 
     def _read_addresses(self, content: dict[str, Any]) -> None:
+        # Auf einer wiederverwendeten Verbindung kann noch die verspaetete
+        # Antwort des vorigen Kommandos eintreffen. Sie traegt dessen
+        # Anfrage-Nummer und wuerde sonst als Antwort auf diese durchgehen --
+        # mit Adressen, die inzwischen einer abgelaufenen Sitzung gehoeren.
+        resp = content.get("resp-session-id")
+        if resp is not None and resp != self.requ_id:
+            _LOGGER.debug("Ignoring a p2pconnect answer of an earlier request")
+            return
         loc_ip = content.get("loc-ip") or [None]
         if loc_ip[0]:
             self.loc = (loc_ip[0], content.get("loc-udpport", 58367))
@@ -1008,7 +1117,10 @@ class CloudP2PSession:
         self.got_addr.set()
 
     def close(self) -> None:
-        """Disconnect from the signalling broker."""
+        """Finish this command -- the link itself stays open for the next one."""
+
+    def shutdown(self) -> None:
+        """Really disconnect from the signalling broker."""
         if self.cli:
             self.cli.loop_stop()
             with contextlib.suppress(OSError):
@@ -1035,6 +1147,7 @@ class _Channel:
     last_pos: int = 1         # Byte-Offset des zuletzt gesendeten App-Frames
     last_frame: bytes | None = None
     last_tx: float = 0.0
+    since_login: int = 0      # Nutzbytes des Geraets seit dem LOGIN
 
 
 class _P2PTransport:
@@ -1052,6 +1165,9 @@ class _P2PTransport:
     PROBE_INTERVAL = 0.12
     ARQ_INTERVAL = 0.40
     ARQ_IDLE = 0.50
+    # Sendetakt des Hole-Punch und der Takt, in dem auf seine Antwort geschaut wird.
+    PUNCH_RESEND = 0.15
+    PUNCH_POLL = 0.01
     _MTU_PROBE_VALUES = (200, 101, 200, 101, 60, 200)
     _HANDSHAKE_STATES = frozenset({"SENT_HELLO", "SENT_A9", "SENT_LOGIN"})
 
@@ -1124,35 +1240,58 @@ class _P2PTransport:
         # kosten jeweils bis zu ein paar Sekunden. Nebeneinander gestartet zahlt
         # der Nutzer vor der Tuer nur die laengere der beiden Wartezeiten. Der
         # Empfangs-Thread laeuft noch nicht, der Socket gehoert also solange
-        # allein dem NAT-Check.
+        # allein dem NAT-Check. Kennen wir die oeffentliche Adresse noch von der
+        # letzten Sitzung, entfaellt er ganz -- bei einem Router, der den
+        # Quellport beibehaelt, ist der oeffentliche Port unser eigener.
         natcheck: list[tuple[str, int]] = []
-        nat_thread = threading.Thread(
-            target=self._natcheck_worker, args=(sock, natcheck),
-            name=f"balter-p2p-nat-{self._duid}", daemon=True,
-        )
-        nat_thread.start()
-
-        cloud = CloudP2PSession(self._client_id, self._duid)
-        self._cloud = cloud
-        cloud.connect()
-        cloud.request_addresses()
-        relay = cloud.wait_for_relay(RELAY_TIMEOUT)
-
-        nat_thread.join(timeout=NATCHECK_TIMEOUT * 5 + 1.0)
-        if nat_thread.is_alive():
-            # Ab hier teilen Empfangsschleife und Punch sich den Socket. Ein noch
-            # laufender NAT-Check wuerde ihnen Pakete wegfangen und das Timeout
-            # unter den Fuessen wegziehen -- lieber sauber scheitern.
-            _LOGGER.error(
-                "NAT check for %s did not finish -- aborting this session instead of "
-                "sharing the socket with it", self._duid,
+        nat_thread: threading.Thread | None = None
+        known_ip = _nat_cached()
+        if known_ip is not None:
+            natcheck.append((known_ip, local_port))
+        else:
+            nat_thread = threading.Thread(
+                target=self._natcheck_worker, args=(sock, natcheck),
+                name=f"balter-p2p-nat-{self._duid}", daemon=True,
             )
-            return False
+            nat_thread.start()
+
+        cloud, reused = CloudP2PSession.acquire(self._client_id, self._duid)
+        self._cloud = cloud
+        cloud.request_addresses()
+        relay = cloud.wait_for_relay(SIGNALLING_REUSE_TIMEOUT if reused else RELAY_TIMEOUT)
+        if relay is None and reused:
+            # Die offen gehaltene Verbindung wirkte gesund, brachte aber keine
+            # Antwort -- broker-seitig abgeraeumt, oder die Registrierung ist
+            # abgelaufen. Einmal frisch aufbauen, statt hier schon aufzugeben.
+            _LOGGER.debug("The reused signalling link stayed silent -- reconnecting")
+            cloud.shutdown()
+            with _SIGNALLING_LOCK:
+                if _SIGNALLING.get(self._client_id) is cloud:
+                    del _SIGNALLING[self._client_id]
+            cloud, _ = CloudP2PSession.acquire(self._client_id, self._duid)
+            self._cloud = cloud
+            cloud.request_addresses()
+            relay = cloud.wait_for_relay(RELAY_TIMEOUT)
+
+        if nat_thread is not None:
+            nat_thread.join(timeout=NATCHECK_TIMEOUT * 5 + 1.0)
+            if nat_thread.is_alive():
+                # Ab hier teilen Empfangsschleife und Punch sich den Socket. Ein noch
+                # laufender NAT-Check wuerde ihnen Pakete wegfangen und das Timeout
+                # unter den Fuessen wegziehen -- lieber sauber scheitern.
+                _LOGGER.error(
+                    "NAT check for %s did not finish -- aborting this session instead of "
+                    "sharing the socket with it", self._duid,
+                )
+                return False
+            if natcheck:
+                _nat_remember(natcheck[0][0], natcheck[0][1] == local_port)
         public_ip, public_port = natcheck[0] if natcheck else ("0.0.0.0", 0)
         if public_port:
             _LOGGER.debug(
-                "NAT check resolved public address %s:%d (local port %d)",
+                "Public address %s:%d (local port %d)%s",
                 public_ip, public_port, local_port,
+                " -- known from an earlier session" if known_ip else " via NAT check",
             )
         else:
             _LOGGER.debug("NAT check got no answer -- relying on the cloud relay")
@@ -1182,6 +1321,11 @@ class _P2PTransport:
             _LOGGER.error(
                 "P2P punch/handshake failed for %s (no channel ids received)", self._duid
             )
+            if known_ip is not None:
+                # Die gemerkte oeffentliche Adresse hat zu keiner Verbindung
+                # gefuehrt -- vielleicht hat der Anschluss eine neue bekommen.
+                # Der naechste Versuch misst sie wieder selbst.
+                _nat_forget()
             return False
         self._send_hello()
         return True
@@ -1193,13 +1337,23 @@ class _P2PTransport:
             out.append(_natcheck_query(sock))
 
     def _punch(self, relay: tuple[str, int]) -> bool:
-        """Hole-punch until the device answers on both channels."""
+        """Hole-punch until the device answers on both channels.
+
+        The punch is repeated in the cadence of the real app, but the answer is
+        watched for in small steps: sleeping out a whole resend interval before
+        even looking added up to 140 ms to every single session -- the answer
+        itself is back in about 60 ms.
+        """
         deadline = time.monotonic() + PUNCH_TIMEOUT
-        while time.monotonic() < deadline and not self._channels_up():
+        while time.monotonic() < deadline:
             self._send(build_punch(self._session_flag, relay[0], relay[1]), relay)
             for conv in self.channels:
                 self._send(build_transport_hdr(0, conv, 0, 0), relay)
-            time.sleep(0.15)
+            next_punch = min(time.monotonic() + self.PUNCH_RESEND, deadline)
+            while time.monotonic() < next_punch:
+                if self._channels_up():
+                    return True
+                time.sleep(self.PUNCH_POLL)
         return self._channels_up()
 
     def _channels_up(self) -> bool:
@@ -1351,6 +1505,25 @@ class _P2PTransport:
         if conv == CH0 and (win & 0xFFFF) == 0x1900 and self._on_media is not None:
             self._on_media(seq, payload)
 
+        if conv == CH0 and not self.device_ready.is_set():
+            # Die Freigabe der App-Sitzung steckt haeufig HINTER Videodaten im
+            # selben Paket oder in einem Fortsetzungspaket -- also jedes Paket
+            # danach absuchen, nicht nur die, die mit einem Frame beginnen. Wird
+            # sie uebersehen, wartet ein Tueroeffnen sein volles Zeitbudget ab
+            # und scheitert an einer Sitzung, die laengst bereit war.
+            self._scan_session_ready(payload)
+            if chan.state == "LOGGED_IN":
+                chan.since_login += len(payload)
+                if chan.since_login > STREAM_IS_PROOF:
+                    # Zweiter, unabhaengiger Beweis: das Geraet sendet den
+                    # Videostrom erst, wenn es die Sitzung freigegeben hat
+                    # (P2P_PROTOCOL.md 9.2 -- es gibt kein Start-Kommando).
+                    self.device_ready.set()
+                    _LOGGER.debug(
+                        "Video is flowing on CH%x -- the device has opened the session",
+                        chan.conv,
+                    )
+
         # JEDES Datenpaket quittieren, nicht nur die mit App-Frame-Marker: ein
         # Medien-Frame ist bis zu 1,2 kB gross und wird auf mehrere UDP-Pakete
         # verteilt, deren Fortsetzungen kein ffffffff tragen. Ohne Quittung laeuft
@@ -1371,9 +1544,6 @@ class _P2PTransport:
         total = struct.unpack("<I", payload[4:8])[0] if len(payload) >= 8 else 0
         outer_msg = payload[0x18] if len(payload) >= 0x1C else 0
 
-        if chan.conv == CH0 and not self.device_ready.is_set():
-            self._scan_session_ready(payload)
-
         if total == 76 and chan.state == "SENT_HELLO":
             self._start_session(chan, payload, src)
         elif (total == 56 or len(payload) == 144) and outer_msg == 0 and chan.state == "SENT_A9":
@@ -1390,11 +1560,16 @@ class _P2PTransport:
         """Look for the device's "session open" frame (0xFE msg13=2).
 
         The device bundles several application frames into one UDP packet, so
-        every embedded frame has to be checked, not just the first. Waiting for
-        the OPENDOOR frame (msg13=4) to come back would be futile: that one only
-        ever travels client -> device (verified against open.pcap).
+        every embedded frame has to be checked, not just the first -- and the
+        packet need not begin with one at all, because a media frame ahead of it
+        may still be running. Only real frame boundaries are examined: decrypting
+        at an arbitrary offset would eventually produce a false "ready" and send
+        an unlock into a session that is not listening yet. Waiting for the
+        OPENDOOR frame (msg13=4) to come back would be futile: that one only ever
+        travels client -> device (verified against open.pcap).
         """
-        i = 0
+        marker = b"\xff\xff\xff\xff"
+        i = 0 if payload[:4] == marker else payload.find(marker)
         while i >= 0 and i + 88 <= len(payload):
             total = struct.unpack("<I", payload[i + 4 : i + 8])[0]
             if 88 <= total <= 2000:
@@ -1841,6 +2016,61 @@ def _await_opendoor_ack(transport: _P2PTransport, end_pos: int, deadline: float)
 
 # --- Standbild / Clip --------------------------------------------------------
 
+class _MediaCollector:
+    """Liest den Medienstrom mit und meldet, sobald ein Standbild vollstaendig ist.
+
+    Ein Schnappschuss braucht genau ein dekodierbares Bild -- also einen
+    Parametersatz (SPS) und ein Keyframe (IDR). Beides steht ueblicherweise gut
+    zwei Sekunden nach dem LOGIN beisammen; bis zum Ende des Aufnahmefensters
+    weiterzulaufen macht das Bild nur aelter und haelt die Station laenger
+    besetzt. Geprueft wird im Takt von :attr:`CHECK_INTERVAL`, damit die
+    Entschluesselung nicht bei jedem Schleifendurchlauf anfaellt.
+    """
+
+    CHECK_INTERVAL = 0.25
+    # Unter dieser Menge Klartext lohnt der Scan nicht: ein einzelnes IDR-Bild
+    # dieser Station ist bereits groesser.
+    MIN_BYTES = 4096
+
+    def __init__(self, assembler: _StreamAssembler, key: bytes) -> None:
+        """Read from ``assembler`` and decrypt what arrives with ``key``."""
+        self._assembler = assembler
+        self._key = key
+        self._tail = bytearray()
+        self._frames: list[bytes] = []
+        self._plain = bytearray()
+        self._next_check = 0.0
+        self._complete = False
+
+    def _drain(self, flush: bool = False) -> None:
+        """Take everything reassembled so far and decrypt the whole frames in it."""
+        self._tail += self._assembler.read(flush=flush)
+        frames, consumed = split_app_frames(bytes(self._tail))
+        del self._tail[:consumed]
+        for frame in frames:
+            self._frames.append(frame)
+            self._plain += decrypt_head(frame[APP_HDR:], self._key)
+
+    def has_still(self) -> bool:
+        """Report whether a decodable picture has arrived."""
+        now = time.monotonic()
+        if self._complete or now < self._next_check:
+            return self._complete
+        self._next_check = now + self.CHECK_INTERVAL
+        self._drain()
+        if len(self._plain) < self.MIN_BYTES:
+            return False
+        self._complete = h264_is_decodable(extract_h264(bytes(self._plain)))
+        if self._complete:
+            _LOGGER.debug("Snapshot complete after %d B of media", self._assembler.total)
+        return self._complete
+
+    def frames(self) -> list[bytes]:
+        """Return every application frame received, remaining gaps closed."""
+        self._drain(flush=True)
+        return self._frames
+
+
 def _grab_video(
     slot: _P2PSlot,
     duid: str,
@@ -1856,10 +2086,13 @@ def _grab_video(
     Returns a JPEG still by default, or the raw H.264 elementary stream when
     ``return_h264`` is set (used by the clip recorder).
 
-    ``duration`` is the recording window AFTER the login. The device needs about
-    two seconds before it starts pushing video, so anything below ~5 s yields
-    very little material. The window ends early when someone wants to unlock a
-    door -- that always has priority over a picture.
+    ``duration`` is the UPPER BOUND of the recording window after the login. A
+    still image ends it as soon as parameter set and keyframe have arrived --
+    usually after about two seconds, which is what keeps a snapshot inside the
+    ten seconds Home Assistant allows a camera to answer in. A clip (
+    ``return_h264``) wants the full window and therefore runs it out. Either way
+    the window ends early when someone wants to unlock a door -- that always has
+    priority over a picture.
     """
     if not _require_password(duid, dynamic_password):
         return None
@@ -1871,13 +2104,25 @@ def _grab_video(
     if transport is None:
         slot.drop_transport()
         return None
+    collector = _MediaCollector(assembler, key)
+    started = time.monotonic()
     try:
-        transport.run_for(duration, until=_UNLOCK_WANTED.is_set)
+        transport.run_for(
+            duration,
+            until=(
+                _UNLOCK_WANTED.is_set
+                if return_h264
+                else lambda: _UNLOCK_WANTED.is_set() or collector.has_still()
+            ),
+        )
     finally:
         _release_or_hand_over(slot, transport, "snapshot")
 
-    _LOGGER.debug("Received %d B of media on CH0 from %s", assembler.total, duid)
-    frames = [frame for _, frame in extract_app_frames(assembler.read(flush=True))]
+    frames = collector.frames()
+    _LOGGER.debug(
+        "Received %d B of media on CH0 from %s in %.1fs",
+        assembler.total, duid, time.monotonic() - started,
+    )
     h264 = _decode_media(frames, (key, FALLBACK_KEY)) if frames else None
     if not h264:
         _LOGGER.debug("No H.264 NAL units recovered from the P2P stream for %s", duid)
@@ -2330,12 +2575,17 @@ async def async_p2p_get_snapshot(
     client_id: str = "",
     oem: str = DEFAULT_OEM,
     duration: float = 8.0,
-    attempts: int = 2,
+    attempts: int = 1,
     warm_idle: float = DEFAULT_WARM_IDLE,
 ) -> bytes | None:
     """Fetch a still image without blocking the event loop.
 
-    A snapshot has no side effects, so a stalled handshake is simply retried.
+    Deliberately ONE attempt by default. A snapshot has no side effects, so a
+    retry looks harmless -- but Home Assistant drops a camera request after ten
+    seconds, and a second attempt cannot start before the station's recovery gap
+    has passed. Nobody would ever see its picture, while it keeps the station
+    busy for another half minute: exactly the slot the doorbell or an unlock
+    needs next.
     """
     for attempt in range(1, attempts + 1):
         image = await hass.async_add_executor_job(

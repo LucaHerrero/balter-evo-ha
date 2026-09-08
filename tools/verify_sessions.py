@@ -504,6 +504,181 @@ async def _check_credentials() -> None:
     ok("das Entladen beendet die Hintergrundauffrischung")
 
 
+# ------------------------------------------------------- Schnappschuss-Fenster
+
+def _nal(header: int, size: int) -> bytes:
+    """Eine H.264-NAL-Einheit: Startcode, Kopfbyte und Fuellung.
+
+    ``header`` ist das vollstaendige NAL-Kopfbyte, wie es die Station sendet
+    (0x67 SPS, 0x68 PPS, 0x65 IDR, 0x41 P-Bild) -- nicht nur die Typnummer.
+    """
+    return bytes([0, 0, 0, 1, header]) + bytes([0x42]) * size
+
+
+def _media_frame(plain: bytes, key: bytes) -> bytes:
+    """Ein Medien-Frame, so wie ihn die Station schickt (Kopf verschluesselt)."""
+    body = p2p.cbc_encrypt(plain[:64], key) + plain[64:]
+    return p2p.build_app_frame(0, body, 0, bytes([1, 2, 3]))
+
+
+def check_snapshot_window() -> None:
+    """Der Schnappschuss endet mit dem Bild, nicht erst mit dem Zeitfenster."""
+    print("Schnappschuss endet, sobald das Bild da ist")
+    key = b"k" * 32
+    p2p._MediaCollector.CHECK_INTERVAL = 0.0
+    try:
+        # Parametersatz plus ein P-Bild: reichlich Material, aber kein Keyframe.
+        no_key = _media_frame(
+            _nal(0x67, 40) + _nal(0x68, 30) + _nal(0x41, 5000), key
+        )
+        key_frame = _media_frame(_nal(0x65, 5000), key)
+
+        assembler = p2p._StreamAssembler()
+        collector = p2p._MediaCollector(assembler, key)
+        assembler.add(1, no_key)
+        assert not collector.has_still()
+        ok("ohne Keyframe gilt das Bild als unfertig")
+
+        assembler.add(1 + len(no_key), key_frame)
+        assert collector.has_still()
+        ok("mit Keyframe ist der Schnappschuss sofort fertig")
+
+        whole = no_key + key_frame
+        assert collector.frames() == [f for _, f in p2p.extract_app_frames(whole)]
+        assert p2p.h264_is_decodable(p2p._decode_media(collector.frames(), (key,)))
+        ok("der Sammler liefert dieselben Frames wie die Auswertung am Stueck")
+    finally:
+        p2p._MediaCollector.CHECK_INTERVAL = 0.25
+
+
+# --------------------------------------------------- Freigabe der App-Sitzung
+
+def _logged_in_transport(key: bytes):
+    """Ein Transport im Zustand nach dem LOGIN, ohne Socket und ohne Netz."""
+    transport = p2p._P2PTransport("dev1", "pw", "0123456789abcdef", key)
+    chan = transport.channels[p2p.CH0]
+    chan.myid = 0x11
+    chan.sess = bytes([1, 2, 3])
+    chan.state = "LOGGED_IN"
+    return transport, chan
+
+
+def _from_device(chan, payload: bytes) -> bytes:
+    """Ein Datenpaket, wie es die Station auf CH0 schickt."""
+    return p2p.build_transport_hdr(
+        p2p.CH0, chan.myid, chan.rcv, 1, payload, win=p2p.WIN_DATA
+    )
+
+
+def check_ready_detection() -> None:
+    """Die Station gibt die Sitzung frei -- das darf nicht uebersehen werden."""
+    print("Freigabe der App-Sitzung")
+    key = b"k" * 32
+
+    transport, chan = _logged_in_transport(key)
+    ready = p2p.build_app_frame(
+        7, p2p.ctrl_frame(0xFE, 0, bytes([0, 1]), key=key, msg13=2), 0, chan.sess
+    )
+    # Die Freigabe steckt HINTER einem Medien-Frame im selben Paket -- genau so
+    # kam sie in der Sitzung an, in der ein Tueroeffnen anschliessend ins
+    # Zeitlimit lief, obwohl das Geraet laengst Video sendete.
+    transport._handle_packet(
+        _from_device(chan, _media_frame(_nal(0x65, 1200), key) + ready), ("1.2.3.4", 5)
+    )
+    assert transport.device_ready.is_set()
+    ok("wird auch hinter einem Medien-Frame im selben Paket gefunden")
+
+    transport, chan = _logged_in_transport(key)
+    for _ in range(4):
+        transport._handle_packet(_from_device(chan, bytes(1400)), ("1.2.3.4", 5))
+        chan.rcv += 1400
+    assert transport.device_ready.is_set()
+    ok("der laufende Videostrom allein beweist sie ebenfalls")
+
+    transport, chan = _logged_in_transport(key)
+    transport._handle_packet(_from_device(chan, bytes(1400)), ("1.2.3.4", 5))
+    assert not transport.device_ready.is_set()
+    ok("ein einzelnes Paket reicht als Beweis dagegen nicht")
+
+
+# ------------------------------------------------------- Cloud-Signalisierung
+
+class FakeMqtt:
+    """Ein paho-Client, der nur ueber seinen Verbindungszustand Auskunft gibt."""
+
+    def __init__(self) -> None:
+        """Start out connected."""
+        self.connected = True
+
+    def is_connected(self) -> bool:
+        """Report the current connection state."""
+        return self.connected
+
+    def loop_stop(self) -> None:
+        """Accept the request to stop the network loop."""
+
+    def disconnect(self) -> None:
+        """Note the disconnect."""
+        self.connected = False
+
+    def publish(self, *args, **kwargs) -> None:
+        """Swallow published messages."""
+
+
+def check_signalling_reuse() -> None:
+    """Die Signalisierung bleibt offen -- aber ihr wird nicht blind vertraut."""
+    print("Cloud-Signalisierung")
+    p2p._SIGNALLING.clear()
+    connects: list[str] = []
+    original = p2p.CloudP2PSession.connect
+
+    def fake_connect(self) -> None:
+        connects.append(self.duid)
+        self.cli = FakeMqtt()
+        self.registered.set()
+
+    p2p.CloudP2PSession.connect = fake_connect
+    try:
+        first, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
+        assert not reused and connects == ["dev1"]
+        flag, requ = first.session_flag, first.requ_id
+
+        second, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
+        assert second is first and reused and connects == ["dev1"]
+        assert second.session_flag != flag and second.requ_id != requ
+        ok("das zweite Kommando spart sich Broker, TLS und Anmeldung")
+
+        second.close()
+        assert second.usable()
+        ok("das Ende eines Kommandos trennt die Verbindung nicht")
+
+        second.got_addr.clear()
+        # Verspaetete Antwort auf die ERSTE Anfrage -- sie traegt deren Nummer.
+        second._read_addresses(
+            {"utd-pub-ip": "1.2.3.4", "utd-pub-udpport": 1, "resp-session-id": requ}
+        )
+        assert second.relay is None and not second.got_addr.is_set()
+        second._read_addresses(
+            {"utd-pub-ip": "5.6.7.8", "utd-pub-udpport": 2,
+             "resp-session-id": second.requ_id}
+        )
+        assert second.relay == ("5.6.7.8", 2)
+        ok("die verspaetete Antwort des vorigen Kommandos wird verworfen")
+
+        first.cli.connected = False
+        third, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
+        assert third is not first and not reused and connects == ["dev1", "dev1"]
+        assert first.cli is None
+        ok("eine abgerissene Verbindung wird sauber ersetzt")
+
+        p2p.release_all_sessions()
+        assert third.cli is None and not p2p._SIGNALLING
+        ok("das Entladen der Integration trennt auch die Signalisierung")
+    finally:
+        p2p.CloudP2PSession.connect = original
+        p2p._SIGNALLING.clear()
+
+
 def main() -> int:
     """Run every check; return 0 when they all passed."""
     check_slot()
@@ -513,6 +688,9 @@ def main() -> int:
     check_stuck_keepalive()
     check_probe()
     check_open_door()
+    check_snapshot_window()
+    check_ready_detection()
+    check_signalling_reuse()
     asyncio.run(_check_credentials())
     print(f"\n{_checks} Pruefungen bestanden")
     return 0
