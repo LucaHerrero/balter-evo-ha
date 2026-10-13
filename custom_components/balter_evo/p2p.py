@@ -718,14 +718,18 @@ def extract_h264(plain: bytes) -> bytes:
 
 # --- Netz-Hilfen -------------------------------------------------------------
 
-def _natcheck_query(sock: socket.socket, tries: int = 5) -> tuple[str, int]:
+def _natcheck_query(
+    sock: socket.socket,
+    server: tuple[str, int] = NATCHECK_SERVER,
+    tries: int = 5,
+) -> tuple[str, int]:
     """Ask the vendor's NAT check server for our public UDP address."""
     request = build_natcheck()
     previous_timeout = sock.gettimeout()
     try:
         sock.settimeout(NATCHECK_TIMEOUT)
         for _ in range(tries):
-            sock.sendto(request, NATCHECK_SERVER)
+            sock.sendto(request, server)
             try:
                 data, _ = sock.recvfrom(512)
             except TimeoutError:
@@ -853,6 +857,43 @@ def _discovery_forget(client_id: str) -> None:
     """Drop a cached discovery answer that turned out to be unusable."""
     with _DISCOVERY_LOCK:
         _DISCOVERY_CACHE.pop(client_id, None)
+
+
+def _discovery_cached_only(client_id: str) -> str | None:
+    """Return a cached discovery answer without triggering a network fetch."""
+    with _DISCOVERY_LOCK:
+        cached = _DISCOVERY_CACHE.get(client_id)
+        if cached and time.monotonic() - cached[0] < DISCOVERY_TTL:
+            return cached[1]
+    return None
+
+
+def _natcheck_server(client_id: str) -> tuple[str, int]:
+    """Resolve the NAT-check server, preferring the discovery answer.
+
+    The real app takes this address from the discovery response (server-type
+    "natcheck"), not from a constant -- verified against libqv-p2p-v2.so, where
+    MqttConnect resolves ``NatCheckUrl`` from the mst server. A hardcoded
+    address would silently break hole punching if the vendor moves the server,
+    even though the discovery answer already carries the new one.
+
+    We read only an *already cached* answer, so the NAT check still starts
+    immediately (in parallel with discovery) instead of waiting for a fresh TLS
+    round trip: the first unlock after a restart falls back to NATCHECK_SERVER
+    -- exactly today's behaviour -- and every later one uses the announced
+    address. Any parsing failure also falls back, so a surprise in the response
+    format can never leave the door unreachable.
+    """
+    answer = _discovery_cached_only(client_id)
+    if answer:
+        try:
+            url = _parse_servers(answer).get("natcheck", {}).get("url", "")
+            host, _, port = url.split("://", 1)[-1].rpartition(":")
+            if host and port.isdigit():
+                return host, int(port)
+        except (ET.ParseError, ValueError):
+            pass
+    return NATCHECK_SERVER
 
 
 def _parse_param(param: str) -> dict[str, str]:
@@ -1250,7 +1291,8 @@ class _P2PTransport:
             natcheck.append((known_ip, local_port))
         else:
             nat_thread = threading.Thread(
-                target=self._natcheck_worker, args=(sock, natcheck),
+                target=self._natcheck_worker,
+                args=(sock, natcheck, _natcheck_server(self._client_id)),
                 name=f"balter-p2p-nat-{self._duid}", daemon=True,
             )
             nat_thread.start()
@@ -1331,10 +1373,12 @@ class _P2PTransport:
         return True
 
     @staticmethod
-    def _natcheck_worker(sock: socket.socket, out: list[tuple[str, int]]) -> None:
+    def _natcheck_worker(
+        sock: socket.socket, out: list[tuple[str, int]], server: tuple[str, int]
+    ) -> None:
         """Run the NAT check in a side thread, tolerating a socket closed under it."""
         with contextlib.suppress(OSError):
-            out.append(_natcheck_query(sock))
+            out.append(_natcheck_query(sock, server))
 
     def _punch(self, relay: tuple[str, int]) -> bool:
         """Hole-punch until the device answers on both channels.
