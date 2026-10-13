@@ -60,7 +60,7 @@ data:
 
 Das Zielverzeichnis muss in `allowlist_external_dirs` freigegeben sein.
 
-## Wie es funktioniert (kurz)
+## Wie es funktioniert
 
 Die Türstation bedient immer **nur eine P2P-Sitzung** und braucht danach 60–90 s Erholung. Türöffnen, Standbild und Stream teilen sich deshalb intern einen Slot; ein Öffnen verdrängt die anderen beiden. Ein kalter Verbindungsaufbau dauert rund 4 s (Cloud-Signalisierung, UDP-Hole-Punching, Login) — darum hält die Integration die Sitzung kurz offen, sodass ein zweites Öffnen sofort geht, wie in der offiziellen App. Protokolldetails: [`P2P_PROTOCOL.md`](P2P_PROTOCOL.md).
 
@@ -73,12 +73,6 @@ logger:
   logs:
     custom_components.balter_evo: debug
 ```
-
-| Symptom | Wahrscheinliche Ursache |
-|---|---|
-| „Die Türstation ist gerade noch beschäftigt" | Eine andere Sitzung läuft (Klingel, App oder Stream). Kurz warten, dann **einmal** erneut öffnen. |
-| Öffnen wird angenommen, aber nichts passiert | Meist eine Tür-PIN, die nicht zum Gerät passt — Feld leer lassen. |
-| Kein Kamerabild, Türöffnen geht | `ffmpeg` fehlt auf dem HA-Host. |
 
 ## Rechtliches
 
