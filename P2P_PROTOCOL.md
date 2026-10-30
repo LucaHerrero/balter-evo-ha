@@ -559,6 +559,25 @@ eingeloggte Sitzung an ein wartendes Türöffnen weiter, statt sie zu schließen
 sonst zahlt genau der Fall „es klingelt, Bild anschauen, öffnen" den vollen
 Handshake **plus** Cooldown.
 
+**Nachtrag 0.12.4 (2026-10-30), aus den Logs einer laufenden Instanz:**
+
+- Der Abstand im Code (`P2P_MIN_GAP`) stand auf 30 s, beobachtet sind aber
+  60–90 s. Am 20.10. blieb ein Öffnen genau 30 s nach dem Ende der vorigen
+  Sitzung beim LOGIN stehen. Er steht jetzt auf **60 s**, das Kamerabild-Caching
+  (`SNAPSHOT_CACHE_TTL`) entsprechend auf 90 s.
+- Vier von fünf Fehlschlägen im Oktober waren `punch/handshake failed (no channel
+  ids received)`. Das traf immer den **ersten** Versuch nach längerer Pause, der
+  zweite ging sofort durch. Antwortet die Station auf den Punch auf keinem Kanal,
+  hat sie keine Sitzung angenommen. Dann gilt **kein** Erholungsabstand, sonst
+  wartet der zweite Druck stumm die volle Pause ab (27.10.: Fehlschlag 22:19:24,
+  Tür offen 22:19:58). Die Signalisierung wird in diesem Fall verworfen.
+- Eine Signalisierung, die länger als 5 min (`SIGNALLING_IDLE_MAX`) ungenutzt war,
+  wird vor dem nächsten Kommando neu aufgebaut. Das kostet ~1 s. Eine
+  `p2pconnect`-Antwort ohne passende `resp-session-id` wird verworfen, auch wenn
+  das Feld ganz fehlt.
+- Ob die tagealte Signalisierung die Ursache der Punch-Fehlschläge war, ist
+  **nicht belegt**. Das muss das nächste Debug-Log zeigen.
+
 ### 10.4 Türöffnen: drei Fehler, die den Befehl wirkungslos machten
 
 Der scharfe Test brauchte vier Anläufe; die ersten drei deckten je einen eigenen

@@ -19,7 +19,7 @@ from homeassistant.helpers.event import async_call_later
 from . import BalterConfigEntry
 from .api import BalterCloudClient
 from .const import CONF_DOOR_PIN, DOMAIN, OEM_ID_COMPACT, RELOCK_DELAY
-from .p2p import P2PDoorBusyError, async_p2p_open_door
+from .p2p import P2PDoorBusyError, P2PStationSilentError, async_p2p_open_door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,13 +139,22 @@ class BalterDoorLock(LockEntity):
                     "Der Türöffner hat den Befehl nicht quittiert. Die Tür wurde "
                     "vermutlich nicht geöffnet."
                 )
+        except P2PStationSilentError as err:
+            # Die Station hat gar nicht geantwortet, also auch keine Sitzung
+            # angenommen: der naechste Versuch darf sofort und mit frischer
+            # Signalisierung starten, ohne Erholungsabstand.
+            _LOGGER.warning("P2P door unlock could not start: %s", err)
+            raise HomeAssistantError(
+                "Die Türstation hat auf den Verbindungsaufbau nicht geantwortet. "
+                "Bitte gleich noch einmal öffnen."
+            ) from err
         except P2PDoorBusyError as err:
             # Der Befehl ging nachweislich nie raus -> gefahrlos erneut versuchbar.
             _LOGGER.warning("P2P door unlock could not start: %s", err)
             raise HomeAssistantError(
                 "Die Türstation ist gerade noch mit einer vorherigen Sitzung "
                 "beschäftigt und hat die Verbindung nicht freigegeben. Bitte etwa "
-                "30 Sekunden warten und dann EINMAL erneut öffnen -- schnelle "
+                "eine Minute warten und dann EINMAL erneut öffnen -- schnelle "
                 "Wiederholungen halten die Station nur länger besetzt."
             ) from err
         except HomeAssistantError:
