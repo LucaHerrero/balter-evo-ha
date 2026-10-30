@@ -43,7 +43,12 @@ STREAM_STOP_TIMEOUT = 5.0
 # ein Versuch, der startet, waehrend sie noch belegt ist, verlaengert die Belegung.
 # Snapshot, Livestream und Tueroeffnen teilen sich deshalb einen Slot und halten
 # diesen Mindestabstand ein (live beobachtet, siehe P2P_PROTOCOL.md §10.3).
-P2P_MIN_GAP = 30.0
+#
+# Beobachtet sind 60-90 s; 30 s waren zu knapp: am 20.10.2026 blieb ein Oeffnen
+# genau 30 s nach dem Ende der vorigen Sitzung beim LOGIN stehen ("still holding
+# an earlier session"). Gilt nur nach einer Sitzung, die die Station tatsaechlich
+# belegt hat -- hat sie auf den Punch gar nicht geantwortet, entfaellt er.
+P2P_MIN_GAP = 60.0
 
 # Wie lange eine Sitzung nach einem Kommando offen gehalten wird. Ihr Neuaufbau
 # kostet je nach Netz 5-8 s (NAT-Check, Cloud-Discovery, MQTT-Signalisierung,
@@ -78,10 +83,10 @@ CREDENTIAL_STALE_AGE = 12 * 3600.0
 CREDENTIAL_REFRESH_WAIT = 1.5
 
 # Mindestalter, ab dem ein neues Standbild geholt wird. Muss ueber dem
-# Slot-Zyklus liegen (P2P_MIN_GAP + Dauer eines Snapshots, zusammen rund 40 s):
+# Slot-Zyklus liegen (P2P_MIN_GAP + Dauer eines Snapshots, zusammen rund 70 s):
 # ein kuerzerer Wert laesst ein offenes Dashboard die Tuerstation dauerhaft
 # belegen, sodass Klingel, App und Tueroeffner keinen Slot mehr bekommen.
-SNAPSHOT_CACHE_TTL = 60.0
+SNAPSHOT_CACHE_TTL = 90.0
 
 
 # Fixed client identity constants captured from the real app's login request.

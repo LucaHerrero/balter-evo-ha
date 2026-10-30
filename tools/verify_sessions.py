@@ -94,6 +94,7 @@ class FakeTransport:
         self.ticks = 0
         self.closed = False
         self.closes = 0
+        self.station_silent = False
         self.device_ready = threading.Event()
         self.device_ready.set()
 
@@ -669,18 +670,67 @@ def check_signalling_reuse() -> None:
         assert second.relay == ("5.6.7.8", 2)
         ok("die verspaetete Antwort des vorigen Kommandos wird verworfen")
 
+        second.got_addr.clear()
+        second.relay = None
+        second._read_addresses({"utd-pub-ip": "9.9.9.9", "utd-pub-udpport": 3})
+        assert second.relay is None and not second.got_addr.is_set()
+        second._read_addresses(
+            {"utd-pub-ip": "5.6.7.8", "utd-pub-udpport": 2,
+             "resp-session-id": str(second.requ_id)}
+        )
+        assert second.relay == ("5.6.7.8", 2)
+        ok("Antworten ohne Nummer zaehlen nicht, die Nummer als Text schon")
+
         first.cli.connected = False
         third, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
         assert third is not first and not reused and connects == ["dev1", "dev1"]
         assert first.cli is None
         ok("eine abgerissene Verbindung wird sauber ersetzt")
 
+        third.last_used -= p2p.SIGNALLING_IDLE_MAX + 1
+        fourth, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
+        assert fourth is not third and not reused and len(connects) == 3
+        assert third.cli is None, "die alte Verbindung blieb offen"
+        again, reused = p2p.CloudP2PSession.acquire("0123456789abcdef", "dev1")
+        assert again is fourth and reused and len(connects) == 3
+        ok("eine lange ungenutzte Verbindung wird vor dem Kommando neu aufgebaut")
+
         p2p.release_all_sessions()
-        assert third.cli is None and not p2p._SIGNALLING
+        assert fourth.cli is None and not p2p._SIGNALLING
         ok("das Entladen der Integration trennt auch die Signalisierung")
     finally:
         p2p.CloudP2PSession.connect = original
         p2p._SIGNALLING.clear()
+
+
+def check_silent_station() -> None:
+    """Ohne jede Antwort auf den Punch gibt es keinen Erholungsabstand."""
+    print("Stumme Station")
+    p2p.release_all_sessions()
+    p2p._P2P_LAST_END.clear()
+
+    silent = FakeStation("dev21")
+    silent.connect = lambda: False
+    silent.station_silent = True
+    result, _ = _unlock("dev21", silent)
+    assert not result.sent and result.silent, result
+    assert "dev21" not in p2p._P2P_LAST_END, "Abstand nach stummer Station gesetzt"
+    started = time.monotonic()
+    result, _ = _unlock("dev21", FakeStation("dev21"))
+    assert result.acked and time.monotonic() - started < 0.5
+    ok("nach einem unbeantworteten Punch startet der naechste Versuch sofort")
+
+    p2p.release_all_sessions()
+    p2p._P2P_LAST_END.clear()
+
+    busy = FakeStation("dev22")
+    busy.connect = lambda: False
+    result, _ = _unlock("dev22", busy)
+    assert not result.silent and "dev22" in p2p._P2P_LAST_END
+    ok("hat die Station geantwortet, bleibt der Abstand bestehen")
+
+    p2p._P2P_LAST_END.clear()
+    p2p.release_all_sessions()
 
 
 def main() -> int:
@@ -695,6 +745,7 @@ def main() -> int:
     check_snapshot_window()
     check_ready_detection()
     check_signalling_reuse()
+    check_silent_station()
     asyncio.run(_check_credentials())
     print(f"\n{_checks} Pruefungen bestanden")
     return 0

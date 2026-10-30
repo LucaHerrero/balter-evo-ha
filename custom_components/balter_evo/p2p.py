@@ -71,6 +71,14 @@ class P2PDoorBusyError(RuntimeError):
     """
 
 
+class P2PStationSilentError(P2PDoorBusyError):
+    """The door station never answered the hole punch at all.
+
+    It therefore never took a session either: the next attempt may start right
+    away, without the recovery gap, and gets a fresh signalling link.
+    """
+
+
 # --- Protokollkonstanten (byte-genau gegen die App-Mitschnitte verifiziert) ---
 
 CH0 = 0x01000000        # Video- und Steuerkanal
@@ -136,6 +144,13 @@ WARM_PROBE_RESEND = 0.5
 # verschluesselten) MQTT-Zugangsdaten. Zwischen zwei Tueroeffnungen aendert sich
 # daran nichts, also nicht jedes Mal TLS-Handshake und Round-Trip bezahlen.
 DISCOVERY_TTL = 1800.0
+
+# Wie lange eine offen gehaltene Signalisierung ungenutzt bleiben darf, bevor sie
+# vor dem naechsten Kommando neu aufgebaut wird. Aus Sicht von paho ist eine tage-
+# alte Verbindung "verbunden und registriert" -- trotzdem scheiterte im Oktober
+# 2026 fast jedes erste Oeffnen nach laengerer Pause am Punch, das zweite ging
+# sofort. Der Neuaufbau kostet rund eine Sekunde, ein Fehlschlag 15.
+SIGNALLING_IDLE_MAX = 300.0
 
 KCP_PARAM = {
     "mode": "custom",
@@ -310,6 +325,14 @@ def _take_warm(duid: str | None, signature: _Signature | None) -> _P2PTransport 
     return transport
 
 
+def _drop_signalling(client_id: str, link: CloudP2PSession) -> None:
+    """Disconnect ``link`` and forget it, so the next command builds a fresh one."""
+    link.shutdown()
+    with _SIGNALLING_LOCK:
+        if _SIGNALLING.get(client_id) is link:
+            del _SIGNALLING[client_id]
+
+
 def release_all_sessions() -> None:
     """Close every session kept open, so the station is free again.
 
@@ -389,7 +412,10 @@ class _P2PSlot:
         last_end = _P2P_LAST_END.get(self._duid, time.monotonic() - P2P_MIN_GAP)
         wait = P2P_MIN_GAP - (time.monotonic() - last_end)
         if wait > 0:
-            _LOGGER.debug(
+            # Info statt Debug: von aussen sieht diese Pause aus wie ein haengendes
+            # Oeffnen. Ohne die Zeile ist im Log nicht zu unterscheiden, ob die
+            # Station langsam war oder wir selbst gewartet haben.
+            _LOGGER.info(
                 "%s waits another %.1fs so the station can recover", self._purpose, wait
             )
             time.sleep(wait)
@@ -407,7 +433,22 @@ class _P2PSlot:
         self.keep_warm = False
         if transport is not None:
             transport.close()
-            _mark_session_end(self._duid)
+            self._session_ended(transport)
+
+    def _session_ended(self, transport: Any) -> None:
+        """Start the recovery gap -- unless the station never took the session.
+
+        A station that did not answer the hole punch has nothing to recover
+        from. Waiting out the gap anyway is exactly what made the second tap
+        after a failed first one sit silently for half a minute (seen live on
+        27.10.2026: failure 22:19:24, door open 22:19:58).
+        """
+        if transport is not None and getattr(transport, "station_silent", False):
+            _LOGGER.debug(
+                "The station never answered -- no recovery gap for %s", self._duid
+            )
+            return
+        _mark_session_end(self._duid)
 
     def __exit__(self, *exc: object) -> None:
         transport = self.transport
@@ -422,7 +463,7 @@ class _P2PSlot:
                 if self.settle > 0:
                     time.sleep(self.settle)
                 transport.close()
-            _mark_session_end(self._duid)
+            self._session_ended(transport)
         _P2P_GATE.release()
 
 
@@ -946,6 +987,7 @@ class CloudP2PSession:
         self.pub: tuple[str, int] | None = None
         self.relay: tuple[str, int] | None = None
         self.got_addr = threading.Event()
+        self.last_used = time.monotonic()
         self.cli: mqtt.Client | None = None
         self._sub = f"{self.client_id}/ust/json"
         self._pub = f"app/ust/json/{self.client_id}"
@@ -963,8 +1005,13 @@ class CloudP2PSession:
         with _SIGNALLING_LOCK:
             link = _SIGNALLING.get(client_id)
             if link is not None and link.usable():
-                link.restart(duid)
-                return link, True
+                idle = time.monotonic() - link.last_used
+                if idle <= SIGNALLING_IDLE_MAX:
+                    link.restart(duid)
+                    return link, True
+                _LOGGER.debug(
+                    "The signalling link was idle for %.0fs -- rebuilding it", idle
+                )
             _SIGNALLING.pop(client_id, None)
         if link is not None:
             # Verbindung ist weg (Broker-Timeout, Netzwechsel) -- sauber abraeumen,
@@ -988,6 +1035,7 @@ class CloudP2PSession:
         self.requ_id = random.randint(-(2**31), -1)
         self.loc = self.pub = self.relay = None
         self.got_addr.clear()
+        self.last_used = time.monotonic()
         _LOGGER.debug("Reusing the open signalling link for %s", duid)
 
     def _hdr(self, cmd: str) -> dict[str, Any]:
@@ -1144,9 +1192,15 @@ class CloudP2PSession:
         # Antwort des vorigen Kommandos eintreffen. Sie traegt dessen
         # Anfrage-Nummer und wuerde sonst als Antwort auf diese durchgehen --
         # mit Adressen, die inzwischen einer abgelaufenen Sitzung gehoeren.
+        # Eine Antwort OHNE Nummer ist ebenso wenig zuzuordnen: die Cloud setzt
+        # sie immer (P2P_PROTOCOL.md §7a), also stammt sie nicht von dieser Anfrage.
+        # Als Text vergleichen: ob die Cloud die Nummer als Zahl oder als String
+        # zurueckgibt, darf nicht ueber "unsere Antwort" entscheiden.
         resp = content.get("resp-session-id")
-        if resp is not None and resp != self.requ_id:
-            _LOGGER.debug("Ignoring a p2pconnect answer of an earlier request")
+        if resp is None or str(resp) != str(self.requ_id):
+            _LOGGER.debug(
+                "Ignoring a p2pconnect answer that is not ours (resp-session-id=%s)", resp
+            )
             return
         loc_ip = content.get("loc-ip") or [None]
         if loc_ip[0]:
@@ -1242,6 +1296,9 @@ class _P2PTransport:
         self.channels = {CH0: _Channel(CH0, 0x07, 0), CH1: _Channel(CH1, 0x08, 1)}
         self.logged_in = threading.Event()      # CH0-LOGIN transportseitig quittiert
         self.device_ready = threading.Event()   # App-Session frei (0xFE msg13=2)
+        # Station hat auf den Punch nicht ein einziges Mal geantwortet -- sie hat
+        # damit auch keine Sitzung angenommen und braucht keine Erholung.
+        self.station_silent = False
 
     @property
     def duid(self) -> str:
@@ -1306,10 +1363,7 @@ class _P2PTransport:
             # Antwort -- broker-seitig abgeraeumt, oder die Registrierung ist
             # abgelaufen. Einmal frisch aufbauen, statt hier schon aufzugeben.
             _LOGGER.debug("The reused signalling link stayed silent -- reconnecting")
-            cloud.shutdown()
-            with _SIGNALLING_LOCK:
-                if _SIGNALLING.get(self._client_id) is cloud:
-                    del _SIGNALLING[self._client_id]
+            _drop_signalling(self._client_id, cloud)
             cloud, _ = CloudP2PSession.acquire(self._client_id, self._duid)
             self._cloud = cloud
             cloud.request_addresses()
@@ -1368,6 +1422,14 @@ class _P2PTransport:
                 # gefuehrt -- vielleicht hat der Anschluss eine neue bekommen.
                 # Der naechste Versuch misst sie wieder selbst.
                 _nat_forget()
+            # Kam auf keinem Kanal auch nur eine Antwort, hat die Station die
+            # Sitzung nie angenommen. Dann braucht sie keine Erholung, und der
+            # Fehler liegt eher an unserer Seite der Signalisierung: die wird
+            # verworfen, damit der naechste Versuch sofort und frisch startet.
+            if not any(chan.myid for chan in self.channels.values()):
+                self.station_silent = True
+                _drop_signalling(self._client_id, cloud)
+                self._cloud = None
             return False
         self._send_hello()
         return True
@@ -1885,6 +1947,7 @@ class UnlockResult:
     ready: bool = False   # Geraet hat die App-Session freigegeben
     sent: bool = False    # OPENDOOR hat den Client verlassen
     acked: bool = False   # Geraet hat die Bytes quittiert
+    silent: bool = False  # Geraet hat auf den Punch nie geantwortet
 
     def __bool__(self) -> bool:
         """Report whether the door station confirmed the unlock."""
@@ -1941,6 +2004,7 @@ def _open_door(
         transport = _P2PTransport(duid, dynamic_password, client_id, key, oem)
         slot.transport = transport
         if not transport.connect():
+            result.silent = transport.station_silent
             return result
         deadline = time.monotonic() + DOOR_SESSION_TIMEOUT
         if not transport.wait(transport.logged_in, LOGIN_TIMEOUT):
@@ -2600,7 +2664,9 @@ async def async_p2p_open_door(
     *extends* the busy period, so hammering it with internal retries lowers the
     success rate instead of raising it. One clean attempt, then -- if the
     handshake stalled before the command left the client -- we raise
-    P2PDoorBusyError so the UI can ask the user to wait ~30 s. If OPENDOOR did go
+    P2PDoorBusyError so the UI can ask the user to wait about a minute -- or
+    P2PStationSilentError when the station never answered at all, which needs no
+    wait and allows the next attempt right away. If OPENDOOR did go
     out but was not acknowledged, that is a real failure (returned as False); a
     retry could open the door twice.
     """
@@ -2615,6 +2681,10 @@ async def async_p2p_open_door(
     if result.sent:
         # Befehl ist raus, nur die Quittung fehlt -> NICHT wiederholen.
         return False
+    if result.silent:
+        raise P2PStationSilentError(
+            "Die Türstation hat auf den Verbindungsaufbau nicht geantwortet."
+        )
     # Handshake blieb vor dem Senden haengen -> Station war belegt. Der Befehl
     # ging nachweislich nie raus, daher als "belegt" statt als "keine Quittung"
     # melden, damit die UI zum erneuten Versuch (nach kurzer Pause) auffordert.
